@@ -1,0 +1,13 @@
+# Compiled Java class files
+*.class
+
+# Maven build directory
+target/
+
+# Large Excel output files
+*.xlsx
+*.xls
+*.csv
+*.jar
+data/output/
+D:/temp_folder/

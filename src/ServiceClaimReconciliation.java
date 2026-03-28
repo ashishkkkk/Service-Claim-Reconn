@@ -1,0 +1,1137 @@
+import java.io.*;
+import java.util.*;
+import java.math.BigDecimal;
+import java.text.SimpleDateFormat;
+import javax.swing.*;
+import javax.swing.filechooser.FileNameExtensionFilter;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.ss.util.CellRangeAddress;
+import org.apache.poi.util.IOUtils;
+import org.apache.poi.openxml4j.opc.OPCPackage;
+import org.apache.poi.openxml4j.opc.PackageAccess;
+import org.apache.poi.openxml4j.exceptions.OpenXML4JException;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
+import org.apache.poi.xssf.streaming.SXSSFSheet;
+import org.apache.poi.xssf.eventusermodel.XSSFReader;
+import org.apache.poi.xssf.eventusermodel.XSSFSheetXMLHandler;
+import org.apache.poi.xssf.model.StylesTable;
+import org.xml.sax.ContentHandler;
+import org.xml.sax.InputSource;
+import org.xml.sax.SAXException;
+import org.xml.sax.XMLReader;
+import org.xml.sax.helpers.XMLReaderFactory;
+
+
+/**
+ * Service Claim Reconciliation Automation - All in One File
+ * Main entry point
+ */
+
+public class ServiceClaimReconciliation {
+    public static void main(String[] args) {
+        try {
+            // Redirect temporary files to D: drive to save C: drive space
+            System.setProperty("java.io.tmpdir", "D:/temp_folder");
+
+            
+            // Increase the maximum allowable size for record types to handle large Excel files
+            IOUtils.setByteArrayMaxOverride(1000000000); // Set limit to ~1GB
+    
+            System.out.println("========================================");
+            System.out.println("Service Claim Recon Automation");
+            System.out.println("========================================");
+            
+            // Set system look and feel for better UI
+            UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+            
+            System.out.println("Please select the DMS Data file...");
+            File dmsFile = selectFile("Select DMS Data File", false);
+            if (dmsFile == null) return;
+            System.out.println("Selected: " + dmsFile.getAbsolutePath());
+            
+            System.out.println("Please select the SAP Data file...");
+            File sapFile = selectFile("Select SAP Data File", false);
+            if (sapFile == null) return;
+            System.out.println("Selected: " + sapFile.getAbsolutePath());
+            
+            String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+            
+            // Create an output directory if it doesn't exist
+            File outputDir = new File("data/output");
+            if (!outputDir.exists()) outputDir.mkdirs();
+            
+            String outputFilePath = "data/output/reconciliation_output_" + timeStamp + ".xlsx";
+            
+            System.out.println("Output will be saved to: " + outputFilePath);
+            
+            process(dmsFile.getAbsolutePath(), sapFile.getAbsolutePath(), outputFilePath);
+            
+        } catch (Exception e) {
+            System.err.println("✗ Error: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+
+    private static File selectFile(String title, boolean isSave) {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle(title);
+        
+        int result;
+        if (isSave) {
+            chooser.setFileFilter(new FileNameExtensionFilter("CSV Files", "csv"));
+            result = chooser.showSaveDialog(null);
+        } else {
+            chooser.setFileFilter(new FileNameExtensionFilter("Excel Files", "xlsx", "xls"));
+            result = chooser.showOpenDialog(null);
+        }
+        
+        if (result == JFileChooser.APPROVE_OPTION) {
+            return chooser.getSelectedFile();
+        }
+        System.out.println("File selection cancelled.");
+        return null;
+    }
+    
+    public static void process(String file1Path, String file2Path, String outputPath) {
+        long startTime = System.currentTimeMillis();
+        try {
+            System.out.println("Reading DMS File: " + file1Path);
+            List<String[]> dmsData = readExcel(file1Path);
+            System.out.println("Loaded " + (dmsData.size() > 0 ? dmsData.size() - 1 : 0) + " data records from DMS.");
+
+            // --- New Filtering Logic ---
+            System.out.println("Filtering DMS data based on excluded dealer codes...");
+            Set<String> excludedDealerCodes = new HashSet<>(Arrays.asList("100079", "100074", "100102", "100153", "100288", "100455"));
+            List<String[]> filteredDmsData = new ArrayList<>();
+            List<String[]> excludedDmsRows = new ArrayList<>();
+            int[] dmsDateCols = {1, 9, 12, 17, 49, 50, 56, 68, 78, 79, 80, 86, 92, 93};
+            int dealerCodeIndex = 6; // Column G
+            int dmsClaimIndex = 2;      // Column C
+
+            Set<String> claimsToExclude = new HashSet<>();
+            if (!dmsData.isEmpty()) {
+                // First pass: Reformat dates AND identify all claims to be excluded in one go
+                for (int i = 1; i < dmsData.size(); i++) {
+                    String[] row = dmsData.get(i);
+                    for (int colIdx : dmsDateCols) {
+                        if (colIdx < row.length) row[colIdx] = reformatDate(row[colIdx]);
+                    }
+                    if (excludedDealerCodes.contains(getVal(row, dealerCodeIndex))) {
+                        claimsToExclude.add(getVal(row, dmsClaimIndex));
+                    }
+                }
+
+                // Second pass: filter rows into the two lists
+                filteredDmsData.add(dmsData.get(0)); // Add header
+                excludedDmsRows.add(dmsData.get(0)); // Add header
+                for (int i = 1; i < dmsData.size(); i++) {
+                    String[] row = dmsData.get(i);
+                    String claimNo = getVal(row, dmsClaimIndex);
+                    if (claimsToExclude.contains(claimNo)) {
+                        excludedDmsRows.add(row);
+                    } else {
+                        filteredDmsData.add(row);
+                    }
+                }
+            }
+            System.out.println((excludedDmsRows.size() > 0 ? excludedDmsRows.size() - 1 : 0) + " records from " + claimsToExclude.size() + " claims moved to Excluded DMS sheet.");
+            System.out.println((filteredDmsData.size() > 0 ? filteredDmsData.size() - 1 : 0) + " records remaining for reconciliation.");
+
+            System.out.println("Reading SAP File: " + file2Path);
+            List<String[]> sapData = readExcel(file2Path);
+            System.out.println("Loaded " + (sapData.size() > 0 ? sapData.size() - 1 : 0) + " data records from SAP.");
+
+            System.out.println("Starting Reconciliation...");
+            ReconResult result = reconcile(filteredDmsData, sapData);
+            
+            System.out.println("Writing Output: " + outputPath);
+            writeExcel(outputPath, result, excludedDmsRows);
+            
+            System.out.println("SUCCESS: File Reconciliation Completed");
+            
+            long endTime = System.currentTimeMillis();
+            long duration = endTime - startTime;
+            long minutes = (duration / 1000) / 60;
+            long seconds = (duration / 1000) % 60;
+            System.out.println("Total Time Taken: " + minutes + " minutes " + seconds + " seconds");
+            
+        } catch (IOException e) {
+            System.err.println("File Error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Reads an Excel file using a memory-efficient streaming approach (SAX parser),
+     * which is suitable for very large files and prevents OutOfMemoryError.
+     * @param filePath Path to the .xlsx file.
+     * @return A list of string arrays, where each array represents a row.
+     * @throws IOException if there is an error reading the file.
+     */
+    private static List<String[]> readExcel(String filePath) throws IOException {
+        List<String[]> records = new ArrayList<>();
+        try (OPCPackage pkg = OPCPackage.open(filePath, PackageAccess.READ)) {
+            XSSFReader xssfReader = new XSSFReader(pkg);
+            StylesTable styles = (StylesTable) xssfReader.getStylesTable();
+            org.apache.poi.xssf.model.SharedStrings sst = xssfReader.getSharedStringsTable();
+            XSSFReader.SheetIterator iter = (XSSFReader.SheetIterator) xssfReader.getSheetsData();
+            
+            // Process only the first sheet
+            if (iter.hasNext()) {
+                try (InputStream stream = iter.next()) {
+                    StreamingSheetHandler handler = new StreamingSheetHandler(records);
+                    XMLReader parser = XMLReaderFactory.createXMLReader();
+                    ContentHandler contentHandler = new XSSFSheetXMLHandler(styles, sst, handler, new DataFormatter(), false);
+                    parser.setContentHandler(contentHandler);
+                    InputSource sheetSource = new InputSource(stream);
+                    parser.parse(sheetSource);
+                }
+            }
+        } catch (SAXException | OpenXML4JException e) {
+            throw new IOException("Failed to parse Excel file in streaming mode.", e);
+        }
+        return records;
+    }
+
+    /**
+     * SAX handler to process a single sheet from an XLSX file row by row.
+     */
+    
+    private static class StreamingSheetHandler implements XSSFSheetXMLHandler.SheetContentsHandler {
+        private final List<String[]> records;
+        private List<String> currentRow;
+        private int headerColCount = 0;
+        private int currentCol = -1;
+
+        public StreamingSheetHandler(List<String[]> records) {
+            this.records = records;
+        }
+
+        @Override
+        public void startRow(int rowNum) {
+            this.currentCol = -1;
+            this.currentRow = new ArrayList<>();
+        }
+
+        @Override
+        public void endRow(int rowNum) {
+            if (rowNum == 0) {
+                headerColCount = currentRow.size();
+            }
+            String[] rowArray = new String[headerColCount];
+            for (int i = 0; i < headerColCount; i++) {
+                rowArray[i] = (i < currentRow.size()) ? currentRow.get(i) : "";
+            }
+            records.add(rowArray);
+        }
+
+        @Override
+        public void cell(String cellReference, String formattedValue, org.apache.poi.xssf.usermodel.XSSFComment comment) {
+            int thisCol;
+            if (cellReference != null) {
+                thisCol = (new org.apache.poi.ss.util.CellReference(cellReference)).getCol();
+            } else {
+                // If the cell reference is null, assume it's the next cell in the sequence.
+                // This handles cases where the SAX parser might not provide a reference.
+                thisCol = currentCol + 1;
+            }
+            int missedCols = thisCol - currentCol - 1;
+            for (int i = 0; i < missedCols; i++) {
+                currentRow.add("");
+            }
+            currentCol = thisCol;
+            currentRow.add(formattedValue);
+        }
+    }
+
+    // Container to hold both main reconciliation results and leftover SAP data
+    private static class ReconResult {
+        List<String[]> mainRows;
+        List<String[]> leftoverRows;
+        Map<String, Integer> dmsCounts;
+        Map<String, Integer> sapCounts;
+        Map<String, String> claimTypes;
+        ReconResult(List<String[]> main, List<String[]> leftover, Map<String, Integer> dmsCounts, Map<String, Integer> sapCounts, Map<String, String> claimTypes) {
+            this.mainRows = main;
+            this.leftoverRows = leftover;
+            this.dmsCounts = dmsCounts;
+            this.sapCounts = sapCounts;
+            this.claimTypes = claimTypes;
+        }
+    }
+  
+    private static ReconResult reconcile(List<String[]> dmsData, List<String[]> sapData) {
+        List<String[]> results = new ArrayList<>();
+        
+        if (dmsData.isEmpty() || sapData.isEmpty()) {
+            System.out.println("One of the files is empty.");
+            return new ReconResult(results, new ArrayList<>(), new HashMap<>(), new HashMap<>(), new HashMap<>());
+        }
+
+        String[] dmsHeaders = dmsData.get(0);
+        
+        // Find Claim No column index in both files
+        int dmsClaimIndex = 2; // Column C
+        int sapClaimIndex = 1; // Column B
+        
+        // Part Number indices for concatenation
+        int dmsPartIndex = 20; // Column U (0-based index 20)
+        int sapPartIndex = 7;  // Column H (0-based index 7)
+
+        // Calculate Claim Counts
+        Map<String, Integer> dmsClaimCounts = new HashMap<>();
+        Map<String, String> claimTypes = new HashMap<>();
+        int dmsServiceTypeIndex = 4; // Column E (0-based)
+
+        for (int i = 1; i < dmsData.size(); i++) {
+            String[] row = dmsData.get(i);
+            String c = getVal(row, dmsClaimIndex);
+            dmsClaimCounts.put(c, dmsClaimCounts.getOrDefault(c, 0) + 1);
+            if (!claimTypes.containsKey(c)) {
+                claimTypes.put(c, getVal(row, dmsServiceTypeIndex));
+            }
+        }
+
+        Map<String, Integer> sapClaimCounts = new HashMap<>();
+        for (int i = 1; i < sapData.size(); i++) {
+            String c = getVal(sapData.get(i), sapClaimIndex);
+            sapClaimCounts.put(c, sapClaimCounts.getOrDefault(c, 0) + 1);
+        }
+
+        // Create output header
+        List<String> outHeader = new ArrayList<>(Arrays.asList(dmsHeaders));
+        outHeader.add("All Result will be on the right side of this column please chcek");
+        
+        outHeader.add("Concatenated Key");
+        outHeader.add("SAP Document No");
+        outHeader.add("SAP Posting Date");
+        outHeader.add("SAP Dealer Code");
+        outHeader.add("SAP GL Account");
+        outHeader.add("Matched Claim No");
+        outHeader.add("DMS Count");
+        outHeader.add("SAP Count");
+        outHeader.add("SAP Claim Date");
+        outHeader.add("DMS Claim Date");
+        outHeader.add("Date Remark");
+        outHeader.add("DMS CGST");
+        outHeader.add("DMS SGST");
+        outHeader.add("DMS IGST");
+        outHeader.add("SAP CGST");
+        outHeader.add("SAP SGST");
+        outHeader.add("SAP IGST");
+        outHeader.add("GST Remark");
+        outHeader.add("DMS CGST Amt");
+        outHeader.add("DMS SGST Amt");
+        outHeader.add("DMS IGST Amt");
+        outHeader.add("SAP CGST Amt");
+        outHeader.add("SAP SGST Amt");
+        outHeader.add("SAP IGST Amt");
+        outHeader.add("GST Amt Remark");
+        outHeader.add("DMS HSN/SAC");
+        outHeader.add("SAP HSN/SAC");
+        outHeader.add("HSN/SAC Remark");
+        outHeader.add("DMS Line Amount");
+        outHeader.add("SAP Amount");
+        outHeader.add("Amount Remark");
+        outHeader.add("Final Remark");
+        outHeader.add("Final Line Level Remark");
+        outHeader.add("final remark for summary");
+
+        // Index for DMS Column J (SubmissionDate) is 9 (0-based)
+        // Index for SAP Column E is 4 (0-based)
+        int dmsDateIndex = 9; 
+        int sapDateIndex = 4;
+
+        // OPTIMIZATION: Build a lookup map for SAP data to change complexity from O(N^2) to O(N)
+        // This is crucial for handling 10 lakh records.
+        Map<String, String[]> sapMap = new HashMap<>();
+        // We also track specific array instances to know exactly which rows were used
+        Set<String[]> usedSapRows = new HashSet<>();
+        
+        for (int i = 1; i < sapData.size(); i++) {
+            String[] row = sapData.get(i);
+            String key = getVal(row, sapClaimIndex) + getVal(row, sapPartIndex);
+            sapMap.putIfAbsent(key, row); // Keep the first occurrence
+        }
+
+        Map<String, Set<String>> claimLevelMismatchReasons = new HashMap<>();
+        Set<String> matchedKeys = new HashSet<>();
+
+        // Add header to results immediately
+        results.add(outHeader.toArray(new String[0]));
+        int totalCols = outHeader.size();
+        int originalCols = dmsHeaders.length;
+
+        // --- First Pass: Perform line-level reconciliation and determine claim status ---
+        for (int i = 1; i < dmsData.size(); i++) {
+            String[] dmsRow = dmsData.get(i);
+            String claimNo = getVal(dmsRow, dmsClaimIndex);
+            String partNo = getVal(dmsRow, dmsPartIndex);
+            String reconKey = claimNo + partNo;
+            
+            // Optimized lookup using HashMap
+            String[] sapRow = sapMap.get(reconKey);
+            
+            if (sapRow != null) {
+                usedSapRows.add(sapRow);
+                matchedKeys.add(reconKey);
+            }
+            
+            String remark; 
+            String dmsDate = getVal(dmsRow, dmsDateIndex); // Already reformatted in process()
+            String sapDate = "";
+            
+            // GST Variables
+            String dmsCgst = getVal(dmsRow, 29); // Column AD
+            String dmsSgst = getVal(dmsRow, 31); // Column AF
+            String dmsIgst = getVal(dmsRow, 33); // Column AH
+            String sapCgst = "";
+            String sapSgst = "";
+            String sapIgst = "";
+            String gstRemark = "";
+
+            // HSN/SAC Code
+            String dmsHsnSac = !getVal(dmsRow, 22).isEmpty() ? getVal(dmsRow, 22) : getVal(dmsRow, 23); //W or X
+            String sapHsnSac = "";
+            String hsnSacRemark;
+            
+            // GST Amount Variables
+            String dmsCgstAmt = cleanNum(getVal(dmsRow, 28)); // Column AC
+            String dmsSgstAmt = cleanNum(getVal(dmsRow, 30)); // Column AE
+            String dmsIgstAmt = cleanNum(getVal(dmsRow, 32)); // Column AG
+            String sapCgstAmt = "";
+            String sapSgstAmt = "";
+            String sapIgstAmt = "";
+            String gstAmtRemark = "";
+
+            // Line Amount variables
+            String dmsLineAmt = cleanNum(getVal(dmsRow, 27)); // Column AB
+            String sapAmt = "";
+            String amtRemark = "";
+
+            String sapDocNo = "";
+            String sapPostingDate = "";
+            String sapDealerCode = "";
+            String sapGl = "";
+            String matchedClaimNo = "";
+            
+            if (sapRow != null) {
+                sapHsnSac = getVal(sapRow, 19); // Column T
+                sapDate = reformatDate(getVal(sapRow, sapDateIndex));
+                matchedClaimNo = getVal(sapRow, sapClaimIndex);
+                sapDocNo = getVal(sapRow, 2);  // Column C
+                sapPostingDate = getVal(sapRow, 5); // Column F
+                sapDealerCode = getVal(sapRow, 6); // Column G
+                sapGl = getVal(sapRow, 23); // Column X
+                
+                // Compare dates (trimming whitespace)
+                if (dmsDate.trim().equalsIgnoreCase(sapDate.trim())) {
+                    remark = "Interfaced";
+                } else {
+                    remark = "Date Mismatch";
+                }
+                
+                // GST Calculation (SAP values / 10)
+                // CGST: SAP Col M (12), SGST: SAP Col O (14), IGST: SAP Col K (10)
+                sapCgst = getSapGstValue(getVal(sapRow, 12));
+                sapSgst = getSapGstValue(getVal(sapRow, 14));
+                sapIgst = getSapGstValue(getVal(sapRow, 10));
+                
+                if (isGstMatch(dmsCgst, sapCgst) && isGstMatch(dmsSgst, sapSgst) && isGstMatch(dmsIgst, sapIgst)) {
+                    gstRemark = "Interfaced";
+                } else {
+                    gstRemark = "Mismatch in GST percentage";
+                }
+                
+                // GST Amount Calculation
+                // SAP Columns: CGST=N(13), SGST=P(15), IGST=L(11)
+                sapCgstAmt = cleanNum(getVal(sapRow, 13));
+                sapSgstAmt = cleanNum(getVal(sapRow, 15));
+                sapIgstAmt = cleanNum(getVal(sapRow, 11));
+                
+                // Line Amount comparison
+                sapAmt = cleanNum(getVal(sapRow, 9)); // Column J
+                boolean isBaseMatch = isGstMatch(dmsLineAmt, sapAmt);
+                if (isBaseMatch) {
+                    amtRemark = "Interfaced";
+                } else {
+                    amtRemark = "Mismatch in Base Amount";
+                }
+
+                double sC = safeParseDouble(sapCgstAmt);
+                double sS = safeParseDouble(sapSgstAmt);
+                double sI = safeParseDouble(sapIgstAmt);
+                double dC = safeParseDouble(dmsCgstAmt);
+                double dS = safeParseDouble(dmsSgstAmt);
+                double dI = safeParseDouble(dmsIgstAmt);
+
+                boolean sapZero = (sC == 0 && sS == 0 && sI == 0);
+                boolean dmsSmall = (dC < 0.5 && dS < 0.5 && dI < 0.5) && (dC > 0 || dS > 0 || dI > 0);
+
+                if (isBaseMatch && sapZero && dmsSmall) {
+                    gstAmtRemark = "GST Value < 0.5";
+                } else if (isGstAmtMatch(dmsCgstAmt, sapCgstAmt) && isGstAmtMatch(dmsSgstAmt, sapSgstAmt) && isGstAmtMatch(dmsIgstAmt, sapIgstAmt)) {
+                    gstAmtRemark = "Interfaced";
+                } else {
+                    gstAmtRemark = "Mismatch in GST Amount";
+                }
+
+                // --- HSN/SAC Remark Logic ---
+                boolean dmsHsnEmpty = dmsHsnSac.trim().isEmpty();
+                boolean sapHsnEmpty = sapHsnSac.trim().isEmpty();
+
+                if (dmsHsnEmpty && sapHsnEmpty) {
+                    hsnSacRemark = "Interfaced";
+                } else if (dmsHsnEmpty) {
+                    hsnSacRemark = "HSN not present in DMS";
+                } else if (sapHsnEmpty) {
+                    hsnSacRemark = "HSN not present in SAP";
+                } else if (dmsHsnSac.equals(sapHsnSac)) {
+                    hsnSacRemark = "Interfaced";
+                } else {
+                    hsnSacRemark = "Mismatch in HSN/SAC";
+                }
+            } else {
+                remark = "Not Present in SAP";
+                gstRemark = "Not Present in SAP";
+                gstAmtRemark = "Not Present in SAP";
+                amtRemark = "Not Present in SAP";
+                hsnSacRemark = "Not Present in SAP";
+            }
+
+            // --- Update claim-level status ---
+            // Collect all mismatch reasons for the entire claim.
+            Set<String> mismatchReasons = claimLevelMismatchReasons.computeIfAbsent(claimNo, k -> new HashSet<>());
+            
+            // Line Level Logic (Local to this row)
+            List<String> currentLineReasons = new ArrayList<>();
+
+            if (remark.contains("Not Present")) {
+                mismatchReasons.add("Not in SAP");
+                currentLineReasons.add("Not in SAP");
+            } else {
+                if (gstRemark.contains("Mismatch")) { mismatchReasons.add("GST %"); currentLineReasons.add("GST %"); }
+                if (gstAmtRemark.contains("Mismatch")) { // Catches "Mismatch in GST Amount"
+                    mismatchReasons.add("GST Amount");
+                    currentLineReasons.add("GST Amount");
+                } else if (gstAmtRemark.equals("GST Value < 0.5")) {
+                    currentLineReasons.add("GST Value < 0.5"); // Specific reason for line level
+                }
+                if (amtRemark.contains("Mismatch")) { mismatchReasons.add("Line Amount"); currentLineReasons.add("Line Amount"); }
+            }
+
+            Collections.sort(currentLineReasons);
+            String lineLevelRemark = currentLineReasons.isEmpty() ? "Interfaced" :
+                                    "[" + String.join(" & ", currentLineReasons) + " Mismatch]";
+
+            // Create output row array directly to save memory
+            String[] outRow = new String[totalCols];
+            
+            // Copy original DMS data
+            System.arraycopy(dmsRow, 0, outRow, 0, Math.min(dmsRow.length, originalCols));
+            
+            int idx = originalCols;
+            outRow[idx++] = "";
+            outRow[idx++] = reconKey;
+            outRow[idx++] = sapDocNo;
+            outRow[idx++] = sapPostingDate;
+            outRow[idx++] = sapDealerCode;
+            outRow[idx++] = sapGl;
+            outRow[idx++] = matchedClaimNo;
+            outRow[idx++] = String.valueOf(dmsClaimCounts.getOrDefault(claimNo, 0));
+            outRow[idx++] = String.valueOf(sapClaimCounts.getOrDefault(claimNo, 0));
+            outRow[idx++] = sapDate;
+            outRow[idx++] = dmsDate;
+            outRow[idx++] = remark;
+            outRow[idx++] = dmsCgst;
+            outRow[idx++] = dmsSgst;
+            outRow[idx++] = dmsIgst;
+            outRow[idx++] = sapCgst;
+            outRow[idx++] = sapSgst;
+            outRow[idx++] = sapIgst;
+            outRow[idx++] = gstRemark;
+            outRow[idx++] = dmsCgstAmt;
+            outRow[idx++] = dmsSgstAmt;
+            outRow[idx++] = dmsIgstAmt;
+            outRow[idx++] = sapCgstAmt;
+            outRow[idx++] = sapSgstAmt;
+            outRow[idx++] = sapIgstAmt;
+            outRow[idx++] = gstAmtRemark;
+            outRow[idx++] = dmsHsnSac;
+            outRow[idx++] = sapHsnSac;
+            outRow[idx++] = hsnSacRemark;
+            outRow[idx++] = dmsLineAmt;
+            outRow[idx++] = sapAmt;
+            outRow[idx++] = amtRemark;
+            // Final Remark (last column) will be filled in second pass
+            outRow[idx++] = ""; // Final Remark
+            outRow[idx++] = lineLevelRemark; // Line Level
+            outRow[idx++] = ""; // final remark for summary
+            
+            results.add(outRow);
+        }
+
+        // --- Second Pass: Add the final claim-level remark to each row ---
+        Set<String> claimsWithSummaryRemarkAdded = new HashSet<>();
+        // Skip header (index 0)
+        for (int i = 1; i < results.size(); i++) {
+            String[] row = results.get(i);
+            String claimNo = row[dmsClaimIndex];
+            Set<String> mismatchReasons = claimLevelMismatchReasons.get(claimNo);
+            String finalRemark;
+            if (mismatchReasons == null || mismatchReasons.isEmpty()) {
+                finalRemark = "Interfaced";
+            } else {
+                List<String> sortedReasons = new ArrayList<>(mismatchReasons);
+                Collections.sort(sortedReasons);
+                finalRemark = "[" + String.join(" & ", sortedReasons) + " Mismatch]";
+            }
+            // Final Remark (visible on all rows as per previous request)
+            row[totalCols - 3] = finalRemark;
+
+            // final remark for summary (replica with logical merging for summary counting)
+            if (!claimsWithSummaryRemarkAdded.contains(claimNo)) {
+                row[totalCols - 1] = finalRemark;
+                claimsWithSummaryRemarkAdded.add(claimNo);
+            } else {
+                row[totalCols - 1] = "";
+            }
+        }
+
+        // --- Generate Leftover SAP Data ---
+        List<String[]> leftoverRows = new ArrayList<>();
+        if (!sapData.isEmpty()) {
+            List<String> sapHeader = new ArrayList<>(Arrays.asList(sapData.get(0)));
+            sapHeader.add("Concatenated Key");
+            sapHeader.add("Duplicate");
+            leftoverRows.add(sapHeader.toArray(new String[0]));
+
+            for (int i = 1; i < sapData.size(); i++) {
+                String[] row = sapData.get(i);
+                // If this specific row instance was not used in reconciliation
+                if (!usedSapRows.contains(row)) {
+                    String key = getVal(row, sapClaimIndex) + getVal(row, sapPartIndex);
+                    String isDuplicate = matchedKeys.contains(key) ? "Yes" : "No";
+                    
+                    String[] newRow = Arrays.copyOf(row, row.length + 2);
+                    newRow[row.length] = key;
+                    newRow[row.length + 1] = isDuplicate;
+                    leftoverRows.add(newRow);
+                }
+            }
+        }
+
+        return new ReconResult(results, leftoverRows, dmsClaimCounts, sapClaimCounts, claimTypes);
+    }
+
+
+    private static int findColumnIndex(String[] headers, String colName) {
+        for (int i = 0; i < headers.length; i++) {
+            // Check for exact match or "ClaimNo" vs "Claim No"
+            if (headers[i].equalsIgnoreCase(colName) || 
+                headers[i].toLowerCase().replace(" ", "").contains(colName.toLowerCase().replace(" ", ""))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static String getVal(String[] row, int index) {
+        if (index >= 0 && index < row.length) {
+            return row[index];
+        }
+        return "";
+    }
+
+    private static String cleanNum(String val) {
+        if (val == null) return "";
+        return val.replace(",", "").trim();
+    }
+
+    private static void writeExcel(String filePath, ReconResult result, List<String[]> excludedDmsRows) throws IOException {
+        List<String[]> rows = result.mainRows;
+        try (Workbook workbook = new SXSSFWorkbook(100)) { // Use SXSSFWorkbook for streaming large files (keep 100 rows in memory)
+            Sheet sheet = workbook.createSheet("Reconciliation");
+
+            // --- Create Cell Styles ---
+            Font headerFont = workbook.createFont();
+            headerFont.setBold(true);
+
+            CellStyle headerStyle = workbook.createCellStyle();
+            headerStyle.setFont(headerFont);
+            headerStyle.setBorderBottom(BorderStyle.THIN);
+            headerStyle.setBorderTop(BorderStyle.THIN);
+            headerStyle.setBorderLeft(BorderStyle.THIN);
+            headerStyle.setBorderRight(BorderStyle.THIN);
+
+            CellStyle mismatchStyle = workbook.createCellStyle();
+            mismatchStyle.setFillForegroundColor(IndexedColors.ROSE.getIndex());
+            mismatchStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+            mismatchStyle.setBorderBottom(BorderStyle.THIN);
+            mismatchStyle.setBorderTop(BorderStyle.THIN);
+            mismatchStyle.setBorderLeft(BorderStyle.THIN);
+            mismatchStyle.setBorderRight(BorderStyle.THIN);
+            mismatchStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+
+            CellStyle defaultStyle = workbook.createCellStyle();
+            defaultStyle.setBorderBottom(BorderStyle.THIN);
+            defaultStyle.setBorderTop(BorderStyle.THIN);
+            defaultStyle.setBorderLeft(BorderStyle.THIN);
+            defaultStyle.setBorderRight(BorderStyle.THIN);
+            defaultStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+
+            Set<Integer> remarkColumnIndices = new HashSet<>();
+            Set<Integer> numericColumnIndices = new HashSet<>();
+            
+            if (!rows.isEmpty()) {
+                String[] header = rows.get(0);
+                for (int i = 0; i < header.length; i++) {
+                    String h = header[i].toLowerCase();
+                    if (h.contains("remark")) remarkColumnIndices.add(i);
+                    if (h.contains("amt") || h.contains("amount") || h.contains("cgst") || h.contains("sgst") || h.contains("igst")) {
+                        numericColumnIndices.add(i);
+                    }
+                }
+            }
+
+            // Manually set column widths for the main sheet to avoid autoSizeColumn overhead
+            if (!rows.isEmpty()) {
+                String[] header = rows.get(0);
+                for (int i = 0; i < header.length; i++) {
+                    String h = header[i].toLowerCase();
+                    int width = 4000; // Default width
+                    if (h.contains("date")) width = 3500;
+                    else if (h.contains("claim")) width = 5000;
+                    else if (h.contains("remark")) width = 8000;
+                    else if (h.contains("amt") || h.contains("amount") || h.contains("gst") || h.contains("val")) width = 4000;
+                    else if (h.contains("part")) width = 5000;
+                    else if (h.contains("key")) width = 6000;
+                    sheet.setColumnWidth(i, width);
+                }
+            }
+
+            for (int i = 0; i < rows.size(); i++) {
+                Row row = sheet.createRow(i);
+                String[] rowData = rows.get(i);
+                for (int j = 0; j < rowData.length; j++) {
+                    Cell cell = row.createCell(j);
+                    String val = rowData[j];
+                    
+                    boolean isMismatch = remarkColumnIndices.contains(j) && (val.contains("Mismatch") || val.contains("Not Present") || val.contains("GST Value < 0.5"));
+                    
+                    if (i == 0) {
+                        cell.setCellValue(val);
+                        cell.setCellStyle(headerStyle);
+                    } else {
+                        // Try to write as number if it's a numeric column
+                        if (numericColumnIndices.contains(j) && val != null && !val.isEmpty()) {
+                            try {
+                                cell.setCellValue(Double.parseDouble(val.replace(",", "")));
+                            } catch (NumberFormatException e) {
+                                cell.setCellValue(val);
+                            }
+                        } else {
+                            cell.setCellValue(val);
+                        }
+                        
+                        if (isMismatch) cell.setCellStyle(mismatchStyle);
+                        else cell.setCellStyle(defaultStyle);
+                    }
+                }
+            }
+
+            // --- Merge cells for the "final remark for summary" column ---
+            if (rows.size() > 2) { // Only merge if there's more than one data row
+                int claimIndex = 2; // Column C
+                int summaryMergeColIdx = -1;
+                String[] header = rows.get(0);
+                for (int k = 0; k < header.length; k++) {
+                    if ("final remark for summary".equalsIgnoreCase(header[k])) {
+                        summaryMergeColIdx = k;
+                        break;
+                    }
+                }
+                if (summaryMergeColIdx != -1) {
+                    int startRow = 1; // First data row index
+                    for (int k = 2; k < rows.size(); k++) { // Start checking from the second data row
+                        String prevClaimNo = rows.get(k - 1)[claimIndex];
+                        String currentClaimNo = rows.get(k)[claimIndex];
+
+                        if (!currentClaimNo.equals(prevClaimNo)) {
+                            if (k - 1 > startRow) { // If the group has more than one row
+                                sheet.addMergedRegion(new CellRangeAddress(startRow, k - 1, summaryMergeColIdx, summaryMergeColIdx));
+                            }
+                            startRow = k; // Start of the new group
+                        }
+                    }
+                    // Merge the last group
+                    if (rows.size() - 1 > startRow) {
+                        sheet.addMergedRegion(new CellRangeAddress(startRow, rows.size() - 1, summaryMergeColIdx, summaryMergeColIdx));
+                    }
+                }
+            }
+
+            // Create Summary Sheet
+            createSummarySheet(workbook, rows);
+            
+            // Create SAP Leftover Sheet
+            Sheet leftoverSheet = workbook.createSheet("SAP Leftover");
+            if (leftoverSheet instanceof SXSSFSheet) {
+                ((SXSSFSheet) leftoverSheet).trackAllColumnsForAutoSizing();
+            }
+            List<String[]> leftoverRows = result.leftoverRows;
+            for (int i = 0; i < leftoverRows.size(); i++) {
+                Row row = leftoverSheet.createRow(i);
+                String[] rowData = leftoverRows.get(i);
+                for (int j = 0; j < rowData.length; j++) {
+                    Cell cell = row.createCell(j);
+                    cell.setCellValue(rowData[j]);
+                    if (i == 0) cell.setCellStyle(headerStyle);
+                    else cell.setCellStyle(defaultStyle);
+                }
+            }
+            // AutoSize for leftover sheet
+            if (!leftoverRows.isEmpty()) for (int i = 0; i < leftoverRows.get(0).length; i++) leftoverSheet.autoSizeColumn(i);
+
+            // --- New Sheet for Excluded DMS Data ---
+            Sheet excludedSheet = workbook.createSheet("Excluded DMS Data (CS Claims)");
+            if (excludedSheet instanceof SXSSFSheet) {
+                ((SXSSFSheet) excludedSheet).trackAllColumnsForAutoSizing();
+            }
+            for (int i = 0; i < excludedDmsRows.size(); i++) {
+                Row row = excludedSheet.createRow(i);
+                String[] rowData = excludedDmsRows.get(i);
+                for (int j = 0; j < rowData.length; j++) {
+                    Cell cell = row.createCell(j);
+                    cell.setCellValue(rowData[j]);
+                    if (i == 0) cell.setCellStyle(headerStyle);
+                    else cell.setCellStyle(defaultStyle);
+                }
+            }
+            // AutoSize for excluded sheet
+            if (!excludedDmsRows.isEmpty()) for (int i = 0; i < excludedDmsRows.get(0).length; i++) excludedSheet.autoSizeColumn(i);
+
+            // Create Count Sheet
+            createCountSheet(workbook, result.dmsCounts, result.sapCounts, result.claimTypes);
+
+            try (FileOutputStream fileOut = new FileOutputStream(filePath)) {
+                workbook.write(fileOut);
+            } finally {
+                ((SXSSFWorkbook) workbook).dispose();
+            }
+        }
+    }
+
+    private static void createCountSheet(Workbook workbook, Map<String, Integer> dmsCounts, Map<String, Integer> sapCounts, Map<String, String> claimTypes) {
+        Sheet sheet = workbook.createSheet("Claim Count Sheet");
+        if (sheet instanceof SXSSFSheet) {
+            ((SXSSFSheet) sheet).trackAllColumnsForAutoSizing();
+        }
+
+        CellStyle headerStyle = workbook.createCellStyle();
+        Font headerFont = workbook.createFont();
+        headerFont.setBold(true);
+        headerStyle.setFont(headerFont);
+        headerStyle.setBorderBottom(BorderStyle.THIN);
+        headerStyle.setBorderTop(BorderStyle.THIN);
+        headerStyle.setBorderLeft(BorderStyle.THIN);
+        headerStyle.setBorderRight(BorderStyle.THIN);
+
+        CellStyle style = workbook.createCellStyle();
+        style.setBorderBottom(BorderStyle.THIN);
+        style.setBorderTop(BorderStyle.THIN);
+        style.setBorderLeft(BorderStyle.THIN);
+        style.setBorderRight(BorderStyle.THIN);
+        
+        CellStyle mismatchStyle = workbook.createCellStyle();
+        mismatchStyle.cloneStyleFrom(style);
+        mismatchStyle.setFillForegroundColor(IndexedColors.ROSE.getIndex());
+        mismatchStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        Row header = sheet.createRow(0);
+        String[] headers = {"Claim No", "Claim Service Type", "DMS Count", "SAP Count", "Remark"};
+        for(int i=0; i<headers.length; i++) {
+            Cell c = header.createCell(i);
+            c.setCellValue(headers[i]);
+            c.setCellStyle(headerStyle);
+        }
+
+        Set<String> allClaims = new TreeSet<>();
+        if (dmsCounts != null) allClaims.addAll(dmsCounts.keySet());
+        if (sapCounts != null) allClaims.addAll(sapCounts.keySet());
+
+        int rowNum = 1;
+        for (String claim : allClaims) {
+            int dms = dmsCounts.getOrDefault(claim, 0);
+            int sap = sapCounts.getOrDefault(claim, 0);
+            
+            String remark;
+            if (dms == sap) {
+                remark = "Matched";
+            } else if (dms == 0 && sap > 0) {
+                remark = "Not Present in DMS";
+            } else if (dms > sap) {
+                if (sap == 0) {
+                    remark = "Not Interfaced";
+                } else {
+                    remark = "Partial interface";
+                }
+            } else {
+                remark = "Duplicate interface";
+            }
+
+            Row row = sheet.createRow(rowNum++);
+            String serviceType = claimTypes.getOrDefault(claim, "Not Present in DMS");
+
+            Cell c0 = row.createCell(0); c0.setCellValue(claim); c0.setCellStyle(style);
+            Cell c1 = row.createCell(1); c1.setCellValue(serviceType); c1.setCellStyle(style);
+            Cell c2 = row.createCell(2); c2.setCellValue(dms); c2.setCellStyle(style);
+            Cell c3 = row.createCell(3); c3.setCellValue(sap); c3.setCellStyle(style);
+            Cell c4 = row.createCell(4); c4.setCellValue(remark);
+            c4.setCellStyle(!remark.equals("Matched") ? mismatchStyle : style);
+        }
+        
+        for(int i=0; i<headers.length; i++) sheet.autoSizeColumn(i);
+    }
+    
+    private static void createSummarySheet(Workbook workbook, List<String[]> rows) {
+        if (rows == null || rows.isEmpty()) return;
+
+        // For SXSSF, we must explicitly track columns for auto-sizing.
+        // This is safe for the summary sheet as it's small.
+        Sheet summarySheet = workbook.createSheet("Summary");
+        if (summarySheet instanceof SXSSFSheet) {
+            ((SXSSFSheet) summarySheet).trackAllColumnsForAutoSizing();
+        }
+        
+        String[] header = rows.get(0);
+        int serviceTypeIndex = 4; // Column E (0-based)
+        int summaryRemarkIndex = -1;
+        int lineRemarkIndex = -1;
+
+        // Find Remarks columns
+        for (int i = 0; i < header.length; i++) {
+            if ("final remark for summary".equalsIgnoreCase(header[i])) {
+                summaryRemarkIndex = i;
+            } else if ("Final Line Level Remark".equalsIgnoreCase(header[i])) {
+                lineRemarkIndex = i;
+            }
+        }
+        if (summaryRemarkIndex == -1) return;
+
+        // Map<ServiceType, Map<Remark, Count>>
+        Map<String, Map<String, Integer>> claimSummaryData = new TreeMap<>();
+        Map<String, Map<String, Integer>> lineSummaryData = new TreeMap<>();
+        Set<String> allRemarks = new TreeSet<>();
+
+        for (int i = 1; i < rows.size(); i++) {
+            String[] row = rows.get(i);
+            if (row.length <= serviceTypeIndex || row.length <= summaryRemarkIndex) continue;
+
+            String finalRemark = row[summaryRemarkIndex];
+            String serviceType = row[serviceTypeIndex];
+            if (serviceType == null || serviceType.trim().isEmpty()) {
+                serviceType = "(Blank)";
+            }
+            
+            // Only count rows where Final Remark is present (unique claims)
+            if (finalRemark != null && !finalRemark.isEmpty()) {
+                
+                claimSummaryData.putIfAbsent(serviceType, new HashMap<>());
+                Map<String, Integer> counts = claimSummaryData.get(serviceType);
+                counts.put(finalRemark, counts.getOrDefault(finalRemark, 0) + 1);
+                
+                allRemarks.add(finalRemark);
+            }
+            
+            // Line Level Logic
+            String lineRemark = (lineRemarkIndex != -1 && row.length > lineRemarkIndex) ? row[lineRemarkIndex] : "";
+            if (lineRemark != null && !lineRemark.isEmpty()) {
+                lineSummaryData.putIfAbsent(serviceType, new HashMap<>());
+                Map<String, Integer> counts = lineSummaryData.get(serviceType);
+                counts.put(lineRemark, counts.getOrDefault(lineRemark, 0) + 1);
+                allRemarks.add(lineRemark);
+            }
+        }
+
+        // Styles
+        CellStyle headerStyle = workbook.createCellStyle();
+        Font font = workbook.createFont();
+        font.setBold(true);
+        headerStyle.setFont(font);
+        headerStyle.setBorderBottom(BorderStyle.THIN);
+        headerStyle.setBorderTop(BorderStyle.THIN);
+        headerStyle.setBorderLeft(BorderStyle.THIN);
+        headerStyle.setBorderRight(BorderStyle.THIN);
+
+        CellStyle dataStyle = workbook.createCellStyle();
+        dataStyle.setBorderBottom(BorderStyle.THIN);
+        dataStyle.setBorderTop(BorderStyle.THIN);
+        dataStyle.setBorderLeft(BorderStyle.THIN);
+        dataStyle.setBorderRight(BorderStyle.THIN);
+
+        CellStyle titleStyle = workbook.createCellStyle();
+        Font titleFont = workbook.createFont();
+        titleFont.setBold(true);
+        titleFont.setFontHeightInPoints((short) 14);
+        titleStyle.setFont(titleFont);
+
+        int rowNum = 0;
+        List<String> remarkList = new ArrayList<>(allRemarks);
+
+        // --- Write Claim Level Table ---
+        Row titleRow1 = summarySheet.createRow(rowNum++);
+        Cell titleCell1 = titleRow1.createCell(0);
+        titleCell1.setCellValue("Claim Level Summary");
+        titleCell1.setCellStyle(titleStyle);
+        rowNum++;
+
+        rowNum = writeSummaryTable(summarySheet, claimSummaryData, remarkList, headerStyle, dataStyle, rowNum);
+
+        rowNum += 2;
+
+        // --- Write Line Level Table ---
+        Row titleRow2 = summarySheet.createRow(rowNum++);
+        Cell titleCell2 = titleRow2.createCell(0);
+        titleCell2.setCellValue("Line Level Summary");
+        titleCell2.setCellStyle(titleStyle);
+        rowNum++;
+
+        writeSummaryTable(summarySheet, lineSummaryData, remarkList, headerStyle, dataStyle, rowNum);
+
+        // AutoSize for summary is fine as it is small
+        for (int i = 0; i <= remarkList.size() + 1; i++) summarySheet.autoSizeColumn(i); // This will now work
+    }
+
+    private static int writeSummaryTable(Sheet sheet, Map<String, Map<String, Integer>> data, List<String> remarkList, CellStyle headerStyle, CellStyle dataStyle, int startRow) {
+        int rowNum = startRow;
+        Row headerRow = sheet.createRow(rowNum++);
+        Cell c0 = headerRow.createCell(0);
+        c0.setCellValue("Claim Service Type");
+        c0.setCellStyle(headerStyle);
+
+        int colNum = 1;
+        for (String remark : remarkList) {
+            Cell c = headerRow.createCell(colNum++);
+            c.setCellValue(remark);
+            c.setCellStyle(headerStyle);
+        }
+        Cell cTotal = headerRow.createCell(colNum);
+        cTotal.setCellValue("Grand Total");
+        cTotal.setCellStyle(headerStyle);
+
+        for (Map.Entry<String, Map<String, Integer>> entry : data.entrySet()) {
+            String serviceType = entry.getKey();
+            Map<String, Integer> counts = entry.getValue();
+            
+            Row row = sheet.createRow(rowNum++);
+            
+            Cell cellType = row.createCell(0);
+            cellType.setCellValue(serviceType);
+            cellType.setCellStyle(dataStyle);
+            
+            int total = 0;
+            colNum = 1;
+            for (String remark : remarkList) {
+                int count = counts.getOrDefault(remark, 0);
+                Cell cellCount = row.createCell(colNum++);
+                cellCount.setCellValue(count);
+                cellCount.setCellStyle(dataStyle);
+                total += count;
+            }
+            Cell cellTotal = row.createCell(colNum);
+            cellTotal.setCellValue(total);
+            cellTotal.setCellStyle(dataStyle);
+        }
+        return rowNum;
+    }
+
+    private static double safeParseDouble(String val) {
+        try {
+            if (val == null || val.trim().isEmpty()) return 0.0;
+            return Double.parseDouble(val.replace(",", "").trim());
+        } catch (Exception e) {
+            return 0.0;
+        }
+    }
+
+    private static String getSapGstValue(String val) {
+        try {
+            if (val == null || val.trim().isEmpty()) return "0";
+            // Remove commas before parsing to handle thousands separators
+            String cleanVal = val.trim().replace(",", "");
+            double d = Double.parseDouble(cleanVal);
+            double res = d / 10.0;
+            if (res == (long) res) return String.format("%d", (long) res);
+            return String.valueOf(res);
+        } catch (Exception e) {
+            return val; // Return original value if parsing fails
+        }
+    }
+
+    private static boolean isGstMatch(String dmsVal, String sapVal) {
+        try {
+            // Normalize empty/null strings to "0" for consistent comparison
+            String cleanDmsVal = (dmsVal == null || dmsVal.trim().isEmpty()) ? "0" : dmsVal.trim().replace(",", "");
+            String cleanSapVal = (sapVal == null || sapVal.trim().isEmpty()) ? "0" : sapVal.trim().replace(",", "");
+
+            // Use BigDecimal for precise decimal comparison, which is essential for financial data
+            BigDecimal bd1 = new BigDecimal(cleanDmsVal);
+            BigDecimal bd2 = new BigDecimal(cleanSapVal);
+
+            // compareTo returns 0 only if the numbers are exactly equal
+            return bd1.compareTo(bd2) == 0;
+        } catch (NumberFormatException e) {
+            // If values are not valid numbers (e.g., text), they must be identical strings to match
+            return dmsVal != null && dmsVal.equals(sapVal);
+        }
+    }
+
+    private static boolean isGstAmtMatch(String dmsVal, String sapVal) {
+        try {
+            // This method uses rounding specifically for GST Amounts as requested.
+            String cleanDmsVal = (dmsVal == null) ? "" : dmsVal.trim().replace(",", "");
+            String cleanSapVal = (sapVal == null) ? "" : sapVal.trim().replace(",", "");
+            
+            double d1 = cleanDmsVal.isEmpty() ? 0 : Double.parseDouble(cleanDmsVal);
+            double d2 = cleanSapVal.isEmpty() ? 0 : Double.parseDouble(cleanSapVal);
+            
+            // Allow difference of +/- 1.0 (e.g. 45.6 matches 45 or 46)
+            return Math.abs(d1 - d2) <= 1.0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Utility to reformat date strings from MM/dd/yy or MM/dd/yyyy to dd/MM/yy.
+     * If the input is not a recognized date format, it returns the original value.
+     */
+    private static String reformatDate(String val) {
+        if (val == null || val.trim().isEmpty()) return val;
+        
+        // Fast check: Dates must have at least two '/' characters
+        int firstSlash = val.indexOf('/');
+        if (firstSlash == -1) return val;
+        int secondSlash = val.indexOf('/', firstSlash + 1);
+        if (secondSlash == -1) return val;
+
+        try {
+            String[] parts = val.split("/");
+            if (parts.length != 3) return val;
+
+            String mm = parts[0].trim();
+            String dd = parts[1].trim();
+            String yy = parts[2].trim();
+
+            if (mm.length() == 1) mm = "0" + mm;
+            if (dd.length() == 1) dd = "0" + dd;
+            if (yy.length() == 4) yy = yy.substring(2); // Convert 2024 to 24
+
+            return dd + "/" + mm + "/" + yy;
+        } catch (Exception e) {
+            return val;
+        }
+    }
+}
