@@ -24,6 +24,8 @@ Service Claim Recon Automation/
 - Java JDK 11 or higher
 - Apache Maven 3.6 or higher
 - MySQL Server 5.7 or higher (must be running)
+- Microsoft SQL Server JDBC Driver (for Azure Synapse)
+- (Optional) SAP Java Connector (JCo) 3.1.x SDK (Requires `sapjco3.jar` and `sapjco3.dll` if using JCo for SAP)
 
 ### Step 1: Start MySQL
 

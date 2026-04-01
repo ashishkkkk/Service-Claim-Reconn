@@ -2,6 +2,7 @@ import java.io.*;
 import java.util.*;
 import java.math.BigDecimal;
 import java.text.SimpleDateFormat;
+import java.sql.*;
 import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import org.apache.poi.ss.usermodel.*;
@@ -44,27 +45,181 @@ public class ServiceClaimReconciliation {
             // Set system look and feel for better UI
             UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
             
-            System.out.println("Please select the DMS Data file...");
-            File dmsFile = selectFile("Select DMS Data File", false);
-            if (dmsFile == null) return;
-            System.out.println("Selected: " + dmsFile.getAbsolutePath());
-            
+            // --- Step 1: Choose Data Source ---
+            String[] options = {"Extract from Raw Data (Excel)", "Extract from Synapse (Backend)"};
+            int choice = JOptionPane.showOptionDialog(null, "How would you like to load DMS data?", 
+                    "Select Data Source", JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, options, options[0]);
+
+            List<String[]> dmsData = null;
+            if (choice == 0) {
+                System.out.println("Please select the DMS Data file...");
+                File dmsFile = selectFile("Select DMS Data File", false);
+                if (dmsFile == null) return;
+                System.out.println("Reading DMS File: " + dmsFile.getAbsolutePath());
+                dmsData = readExcel(dmsFile.getAbsolutePath());
+            } else if (choice == 1) {
+                dmsData = fetchDmsDataFromSynapse();
+            } else {
+                return;
+            }
+
             System.out.println("Please select the SAP Data file...");
             File sapFile = selectFile("Select SAP Data File", false);
             if (sapFile == null) return;
             System.out.println("Selected: " + sapFile.getAbsolutePath());
             
-            String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+            String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new java.util.Date());
+            //String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+
             String outputFilePath = "reconciliation_output_" + timeStamp + ".xlsx";
             System.out.println("Output will be saved to: " + outputFilePath);
             
-            process(dmsFile.getAbsolutePath(), sapFile.getAbsolutePath(), outputFilePath);
+            process(dmsData, sapFile.getAbsolutePath(), outputFilePath);
             
         } catch (Exception e) {
             System.err.println("✗ Error: " + e.getMessage());
             e.printStackTrace();
             System.exit(1);
         }
+    }
+
+    private static List<String[]> fetchDmsDataFromSynapse() {
+        String startInput = JOptionPane.showInputDialog("Enter Start Date (DD.MM.YYYY):");
+        String endInput = JOptionPane.showInputDialog("Enter End Date (DD.MM.YYYY):");
+        
+        if (startInput == null || endInput == null) return null;
+
+        List<String[]> records = new ArrayList<>();
+        // Note: These should ideally come from a config file
+        String url = "jdbc:sqlserver://re-platform-azure-synapse-analytics-prod.sql.azuresynapse.net:1433;database=RE_PLATFORM_SYNAPSE_SQL_ODS_PROD;encrypt=true;trustServerCertificate=false;hostNameInCertificate=*.sql.azuresynapse.net;loginTimeout=30;";
+        String user = "sqlreaduser_dmsqateam";
+        String password = "$o!4m014k@12";
+
+        // Convert DD.MM.YYYY to YYYY-MM-DD for Synapse SQL
+        String startDate = convertToSqlDate(startInput);
+        String endDate = convertToSqlDate(endInput);
+
+        System.out.println("Connecting to Synapse and fetching data for " + startDate + " to " + endDate + "...");
+
+        String query = "Select Distinct " +
+                "    DCT.CITY, " +
+                "    DA.name DEALER_NAME, " +
+                "    DCT.REGIONID as Region, " +
+                "    DCT.STATE as [STATE], " +
+                "    CASE " +
+                "        WHEN DCT.PwcClaimtype = 1 THEN 'Good Will' " +
+                "        WHEN DCT.PwcClaimtype = 2 THEN 'Technical Campaign' " +
+                "        WHEN DCT.PwcClaimtype = 3 THEN 'Extended warranty' " +
+                "        WHEN DCT.PwcClaimtype = 4 THEN 'In Transit' " +
+                "        WHEN DCT.PwcClaimtype = 6 THEN 'Spare part warranty' " +
+                "        WHEN DCT.PwcClaimtype = 7 THEN 'In-Warranty' " +
+                "        WHEN DCT.PwcClaimtype = 8 THEN 'Free service' " +
+                "        WHEN DCT.PwcClaimtype = 10 THEN 'AMC-EW' " +
+                "        WHEN DCT.PwcClaimtype = 11 THEN 'Paid service' " +
+                "        WHEN DCT.PwcClaimtype = 12 THEN 'GMA' " +
+                "        WHEN DCT.PwcClaimtype = 21 THEN 'REOWN In-Warranty' " +
+                "        WHEN DCT.PwcClaimtype = 20 THEN 'REOWN Free Service' " +
+                "        WHEN DCT.PwcClaimtype = 15 THEN 'EW-WT' " +
+                "        WHEN DCT.PwcClaimtype = 19  THEN 'RE Maestro' " +
+                "    END as [Claim_service_type], " +
+                "    DCT.DEALER DEALER_CODE, " +
+                "    DCT.PROVISIONALCLAIMNO, " +
+                "    DCT.CLAIMNO, " +
+                "    DCT.CLAIMDATE, " +
+                "    DCT.SUBMISIONDATE, " +
+                "    CAST(CASE " +
+                "        WHEN DCT.workflowstatus = 2 THEN 'Approved' " +
+                "        WHEN DCT.Workflowstatus = 3 THEN 'Rejected' " +
+                "        WHEN DCT.workflowstatus = 1 THEN 'Submitted' " +
+                "        WHEN DCT.workflowstatus = 4 THEN 'Returned' " +
+                "        ELSE 'Draft/Other' " +
+                "    END as varchar(15)) as workflowstatus, " +
+                "    DCT.MODELCODE as [Material_Code], " +
+                "    DCT.ITEMNAME [Model_Name], " +
+                "    DCT.CHASISNO, " +
+                "    DCT.ENGINENO, " +
+                "    DCT.DATEOFSALE, " +
+                "    DCT.ODOMETERKM, " +
+                "    DCT.DEFECTCODE, " +
+                "    DCL.PRIMARYPARTINDICATOR, " +
+                "    DCL.ITEMNAME as ItemDesc, " +
+                "    DCL.ITEMID partNumber, " +
+                "    DCL.PARTQTY [Claim_Quantity], " +
+                "    DCL.PARTPRICE AS [Unit_price], " +
+                "    DCT.CLAIMAMOUNT as [Line_amount], " +
+                "    DCL.CGST, " +
+                "    DCL.CGSTPERCENT, " +
+                "    DCL.SGST, " +
+                "    DCL.SGSTPERCENT, " +
+                "    DCL.IGST, " +
+                "    DCL.IGSTPERCENT, " +
+                "    DCL.SAPCRAMOUNT Amount, " +
+                "    DCT.DELIVERYCHALAN, " +
+                "    DCL.SAPDOCNO as [SAP_document_Number], " +
+                "    '' as [SAP_Accounting_Doc_No], " +
+                "    DCL.SAPCRDATE, " +
+                "    DCL.LABOURAMOUNT [SAP Part NDP/ Labor amount], " +
+                "    DCL.SAPCRAMOUNT, " +
+                "    DCL.INVOICENUMBER as [SAP Debit invoice number], " +
+                "    DCL.INVOICEDATE [SAP Debit invoice Date], " +
+                "    DCL.FFIRNO, " +
+                "    DCL.PWCFFIRSTATUS " +
+                "from PwCBYODClaimTblEntity DCT (nolock) " +
+                "Inner Join PwCBYODClaimLnEntity DCL (nolock) on DCL.claimno = DCT.claimno " +
+                "left join prod1_account DA on DA.xrm_sapdealercode = DCT.DEALER " +
+                "WHERE DCT.WorkflowStatus in (1,2,3,4) " +
+                "  AND cast(DCT.CLAIMDATE as date) between ? and ?";
+
+        try (Connection conn = DriverManager.getConnection(url, user, password);
+             PreparedStatement pstmt = conn.prepareStatement(query)) {
+            
+            pstmt.setString(1, startDate);
+            pstmt.setString(2, endDate);
+            
+            try (ResultSet rs = pstmt.executeQuery()) {
+                ResultSetMetaData metaData = rs.getMetaData();
+                int columnCount = metaData.getColumnCount();
+
+                // Add Header Row
+                String[] headers = new String[columnCount];
+                for (int i = 1; i <= columnCount; i++) {
+                    headers[i - 1] = metaData.getColumnName(i);
+                }
+                records.add(headers);
+
+                // Add Data Rows
+                while (rs.next()) {
+                    String[] row = new String[columnCount];
+                    for (int i = 1; i <= columnCount; i++) {
+                        Object val = rs.getObject(i);
+                        row[i - 1] = (val == null) ? "" : val.toString();
+                    }
+                    records.add(row);
+                }
+            }
+            int rowCount = records.size() - 1; // Subtract 1 for the header row
+            System.out.println("Successfully fetched " + rowCount + " records from Synapse.");
+            
+            // Show count in UI for easy verification against Synapse
+            JOptionPane.showMessageDialog(null, "Successfully fetched " + rowCount + " records from Synapse.\n" +
+                    "Please verify this matches the result count in your Synapse workspace.", "Extraction Verification", JOptionPane.INFORMATION_MESSAGE);
+        } catch (SQLException e) {
+            System.err.println("Synapse Error: " + e.getMessage());
+            JOptionPane.showMessageDialog(null, "Error connecting to Synapse: " + e.getMessage());
+        }
+        return records;
+    }
+
+    /**
+     * Converts date from DD.MM.YYYY to YYYY-MM-DD for SQL queries.
+     */
+    private static String convertToSqlDate(String input) {
+        if (input == null || !input.contains(".")) return input;
+        String[] parts = input.split("\\.");
+        if (parts.length == 3) {
+            return parts[2].trim() + "-" + parts[1].trim() + "-" + parts[0].trim();
+        }
+        return input;
     }
 
     private static File selectFile(String title, boolean isSave) {
@@ -87,19 +242,17 @@ public class ServiceClaimReconciliation {
         return null;
     }
     
-    public static void process(String file1Path, String file2Path, String outputPath) {
+    public static void process(List<String[]> dmsData, String file2Path, String outputPath) {
         long startTime = System.currentTimeMillis();
         try {
-            System.out.println("Reading DMS File: " + file1Path);
-            List<String[]> dmsData = readExcel(file1Path);
-            System.out.println("Loaded " + (dmsData.size() > 0 ? dmsData.size() - 1 : 0) + " data records from DMS.");
+            if (dmsData == null || dmsData.isEmpty()) throw new IOException("No DMS data loaded.");
 
             // --- New Filtering Logic ---
             System.out.println("Filtering DMS data based on excluded dealer codes...");
             Set<String> excludedDealerCodes = new HashSet<>(Arrays.asList("100079", "100074", "100102", "100153", "100288", "100455"));
             List<String[]> filteredDmsData = new ArrayList<>();
             List<String[]> excludedDmsRows = new ArrayList<>();
-            int[] dmsDateCols = {1, 9, 12, 17, 49, 50, 56, 68, 78, 79, 80, 86, 92, 93};
+            int[] dmsDateCols = {1, 9, 12, 17, 49, 50, 56, 68, 78, 79, 80, 86, 87, 90, 92, 93};
             int dealerCodeIndex = 6; // Column G
             int dmsClaimIndex = 2;      // Column C
 
@@ -415,7 +568,7 @@ public class ServiceClaimReconciliation {
                 sapDate = reformatDate(getVal(sapRow, sapDateIndex));
                 matchedClaimNo = getVal(sapRow, sapClaimIndex);
                 sapDocNo = getVal(sapRow, 2);  // Column C
-                sapPostingDate = getVal(sapRow, 5); // Column F
+                sapPostingDate = reformatDate(getVal(sapRow, 5)); // Column F
                 sapDealerCode = getVal(sapRow, 6); // Column G
                 sapGl = getVal(sapRow, 23); // Column X
                 
