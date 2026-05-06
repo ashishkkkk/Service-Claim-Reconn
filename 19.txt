@@ -18,6 +18,8 @@ import org.apache.poi.xssf.eventusermodel.XSSFSheetXMLHandler;
 import org.apache.poi.xssf.model.StylesTable;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.InputSource;
+import java.awt.Toolkit;
+import java.awt.datatransfer.DataFlavor;
 import org.xml.sax.SAXException;
 import org.xml.sax.XMLReader;
 import org.xml.sax.helpers.XMLReaderFactory;
@@ -63,18 +65,28 @@ public class ServiceClaimReconciliation {
                 return;
             }
 
-            System.out.println("Please select the SAP Data file...");
-            File sapFile = selectFile("Select SAP Data File", false);
-            if (sapFile == null) return;
-            System.out.println("Selected: " + sapFile.getAbsolutePath());
+            // --- Step 2: Choose SAP Data Source ---
+            String[] sapOptions = {"Extract from Raw Data (Excel)", "Extract from SAP Backend (Script)"};
+            int sapChoice = JOptionPane.showOptionDialog(null, "How would you like to load SAP data?", 
+                    "Select SAP Data Source", JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, sapOptions, sapOptions[0]);
+
+            List<String[]> sapData = null;
+            if (sapChoice == 0) {
+                System.out.println("Please select the SAP Data file...");
+                File sapFile = selectFile("Select SAP Data File", false);
+                if (sapFile == null) return;
+                System.out.println("Reading SAP File: " + sapFile.getAbsolutePath());
+                sapData = readExcel(sapFile.getAbsolutePath());
+            } else if (sapChoice == 1) {
+                sapData = downloadSapDataViaScript();
+            }
+
+            if (sapData == null || sapData.isEmpty()) return;
             
             String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new java.util.Date());
-            //String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
-
-            String outputFilePath = "reconciliation_output_" + timeStamp + ".xlsx";
+            String outputFilePath = "reconciliation_output_" + timeStamp + ".xlsx"; // Corrected variable name
             System.out.println("Output will be saved to: " + outputFilePath);
-            
-            process(dmsData, sapFile.getAbsolutePath(), outputFilePath);
+            process(dmsData, sapData, outputFilePath);
             
         } catch (Exception e) {
             System.err.println("✗ Error: " + e.getMessage());
@@ -116,14 +128,13 @@ public class ServiceClaimReconciliation {
                 "        WHEN DCT.PwcClaimtype = 8 THEN 'Free service' " +
                 "        WHEN DCT.PwcClaimtype = 10 THEN 'AMC-EW' " +
                 "        WHEN DCT.PwcClaimtype = 11 THEN 'Paid service' " +
-                "        WHEN DCT.PwcClaimtype = 12 THEN 'GMA' " +
                 "        WHEN DCT.PwcClaimtype = 21 THEN 'REOWN In-Warranty' " +
                 "        WHEN DCT.PwcClaimtype = 20 THEN 'REOWN Free Service' " +
                 "        WHEN DCT.PwcClaimtype = 15 THEN 'EW-WT' " +
                 "        WHEN DCT.PwcClaimtype = 19  THEN 'RE Maestro' " +
                 "    END as [Claim_service_type], " +
-                "    DCT.DEALER DEALER_CODE, " +
                 "    DCT.PROVISIONALCLAIMNO, " +
+                "    DCT.DEALER DEALER_CODE, " +
                 "    DCT.CLAIMNO, " +
                 "    DCT.CLAIMDATE, " +
                 "    DCT.SUBMISIONDATE, " +
@@ -168,7 +179,9 @@ public class ServiceClaimReconciliation {
                 "Inner Join PwCBYODClaimLnEntity DCL (nolock) on DCL.claimno = DCT.claimno " +
                 "left join prod1_account DA on DA.xrm_sapdealercode = DCT.DEALER " +
                 "WHERE DCT.WorkflowStatus in (1,2,3,4) " +
-                "  AND cast(DCT.CLAIMDATE as date) between ? and ?";
+                "  AND cast(DCT.SUBMISIONDATE as date) between ? and ? " +
+                "  AND DCT.PwcClaimtype IN (1, 2, 3, 4, 6, 7, 8, 10, 11, 12, 15, 19, 20, 21) " +
+                "ORDER BY DCT.CLAIMNO ASC";
 
         try (Connection conn = DriverManager.getConnection(url, user, password);
              PreparedStatement pstmt = conn.prepareStatement(query)) {
@@ -210,6 +223,220 @@ public class ServiceClaimReconciliation {
         return records;
     }
 
+    /** 
+     * Automates SAP GUI to download data via SE16 based on provided VBScript logic.
+     */
+    private static List<String[]> downloadSapDataViaScript() {
+        String startInput = JOptionPane.showInputDialog("Enter Start Date (DD.MM.YYYY):");
+        String endInput = JOptionPane.showInputDialog("Enter End Date (DD.MM.YYYY):");
+        
+        if (startInput == null || endInput == null) return null;
+
+        // Secure password prompt
+        JPanel panel = new JPanel();
+        JLabel label = new JLabel("Enter SAP Password:");
+        JPasswordField pass = new JPasswordField(10);
+        panel.add(label);
+        panel.add(pass);
+        String[] options = new String[]{"OK", "Cancel"};
+        int option = JOptionPane.showOptionDialog(null, panel, "SAP Authentication",
+                JOptionPane.NO_OPTION, JOptionPane.PLAIN_MESSAGE, null, options, options[1]);
+        
+        if (option != 0) return null;
+        String password = new String(pass.getPassword());
+
+        try {
+            File vbsFile = File.createTempFile("sap_extract", ".vbs");
+            vbsFile.deleteOnExit();
+            
+            try (PrintWriter out = new PrintWriter(new FileWriter(vbsFile))) {
+                out.println("On Error Resume Next"); // General error handling
+                out.println("Set SapGuiAuto = GetObject(\"SAPGUI\")");
+                out.println("Set application = SapGuiAuto.GetScriptingEngine");
+                // Select the specific connection
+                out.println("Set connection = application.OpenConnection(\"PRE Load Balance\", True)");
+                out.println("Set session = connection.Children(0)");
+                out.println("WScript.Sleep 2000"); // Wait for session to open
+
+                out.println("session.findById(\"wnd[0]\").maximize");
+                
+                // Perform Login
+                out.println("session.findById(\"wnd[0]/usr/txtRSYST-BNAME\").text = \"Bijus\"");
+                out.println("session.findById(\"wnd[0]/usr/pwdRSYST-BCODE\").text = \"" + password + "\"");
+                out.println("session.findById(\"wnd[0]\").sendVKey 0");
+                out.println("WScript.Sleep 2000"); // Wait for login to process
+                
+                // Handle Multi-Logon popup if it appears
+                out.println("If session.Children.Count > 1 Then");
+                out.println("   On Error Resume Next");
+                out.println("   session.findById(\"wnd[1]/usr/radMULTI_LOGON_OPT2\").select");
+                out.println("   session.findById(\"wnd[1]/tbar[0]/btn[0]\").press");
+                out.println("   WScript.Sleep 1000"); // Wait for popup to close
+                out.println("End If");
+                out.println("On Error GoTo 0"); // End specific error handling for popup
+                
+                // Navigate to SE16 and process the table
+                out.println("session.findById(\"wnd[0]/tbar[0]/okcd\").text = \"/nse16\"");
+                out.println("session.findById(\"wnd[0]\").sendVKey 0");
+                out.println("WScript.Sleep 1500"); // Wait for SE16 screen
+                out.println("session.findById(\"wnd[0]/usr/ctxtDATABROWSE-TABLENAME\").text = \"ZFI_SER_CLAIM\"");
+                out.println("session.findById(\"wnd[0]\").sendVKey 0");
+                out.println("WScript.Sleep 1500"); // Wait for selection screen to load
+
+                // Setting selection dates (DD.MM.YYYY)
+                out.println("session.findById(\"wnd[0]/usr/ctxtI5-LOW\").setFocus");
+                out.println("session.findById(\"wnd[0]/usr/ctxtI5-LOW\").text = \"" + startInput + "\"");
+                out.println("WScript.Sleep 200"); // Small pause after setting text
+                out.println("session.findById(\"wnd[0]/usr/ctxtI5-HIGH\").setFocus");
+                out.println("session.findById(\"wnd[0]/usr/ctxtI5-HIGH\").text = \"" + endInput + "\"");
+                // Clear "Maximum number of hits" limit to fetch all data
+                out.println("On Error Resume Next");
+                out.println("session.findById(\"wnd[0]/usr/txtMAX_SEL\").text = \"9999999\"");
+                out.println("session.findById(\"wnd[0]/usr/txtMAX_HITS\").text = \"9999999\"");
+                out.println("On Error GoTo 0");
+                out.println("session.findById(\"wnd[0]\").sendVKey 0"); // Ensure date input is registered
+                out.println("WScript.Sleep 500");
+                
+                // Execute (F8)
+                out.println("session.findById(\"wnd[0]/tbar[1]/btn[8]\").press");
+                out.println("WScript.Sleep 2000");
+                out.println("Do While session.Busy: WScript.Sleep 1000: Loop");
+                out.println("WScript.Sleep 2000"); 
+
+                // 1. POPUP HANDLER: Handle "Number of hits" or "Information" popups
+                out.println("While session.Children.Count > 1");
+                out.println("   On Error Resume Next");
+                out.println("   session.findById(\"wnd[1]/tbar[0]/btn[0]\").press");
+                out.println("   WScript.Sleep 1500");
+                out.println("   On Error GoTo 0");
+                out.println("Wend");
+                
+                // 2. VERIFICATION & SCROLLING: Ensure we are on a result screen with a Grid
+                out.println("On Error Resume Next");
+                out.println("Set grid = session.findById(\"wnd[0]/usr/cntlGRID1/shellcont/shell\", False)");
+                out.println("If Not grid Is Nothing Then");
+                out.println("   WScript.Sleep 1000");
+                
+                // Force ALV to load all records into buffer by iteratively scrolling to the end
+                // This ensures grid.rowCount reflects the true total for very large datasets
+                out.println("   last_row_count = 0");
+                out.println("   current_row_count = 0");
+                out.println("   Do");
+                out.println("      last_row_count = current_row_count");
+                out.println("      grid.firstVisibleRow = grid.rowCount - 1"); // Scroll to the very end
+                out.println("      WScript.Sleep 2000"); // Allow time for rendering/buffering
+                out.println("      current_row_count = grid.rowCount");
+                out.println("      WScript.StdOut.WriteLine \"PROGRESS: Current grid rowCount: \" & current_row_count");
+                out.println("   Loop While current_row_count > last_row_count"); // Repeat until rowCount stabilizes (no new rows appear)
+
+                out.println("   grid.firstVisibleRow = 0");
+                out.println("   WScript.Sleep 1500");
+
+                out.println("   total_rows = grid.rowCount");
+                out.println("   If total_rows > 0 Then");
+                out.println("      WScript.StdOut.WriteLine \"PROGRESS: Final total rows detected: \" & total_rows");
+                out.println("      col_count = grid.columnCount");
+                // Pre-fetch column names to speed up cell-by-cell reading
+                out.println("      Dim cols()");
+                out.println("      ReDim cols(col_count - 1)");
+                out.println("      header_row = \"\"");
+                out.println("         For j = 0 To col_count - 1");
+                out.println("            cols(j) = grid.ColumnOrder.ElementAt(j)");
+                out.println("            header_row = header_row & grid.GetColumnTitle(cols(j)) & vbTab");
+                out.println("         Next");
+                out.println("      WScript.StdOut.WriteLine \"DATA:\" & header_row");
+                
+                // Extract in 5000-row chunks
+                out.println("      For i = 0 To total_rows - 1 Step 6000");
+                out.println("         grid.firstVisibleRow = i"); 
+                out.println("         WScript.Sleep 500"); // Give SAP time to render new visible rows
+                out.println("         chunk_end = i + 5999");
+                out.println("         If chunk_end >= total_rows Then chunk_end = total_rows - 1");
+                out.println("         For k = i To chunk_end");
+                out.println("            row_data = \"\"");
+                out.println("            For j = 0 To col_count - 1");
+                out.println("               cell_value = grid.getCellValue(k, cols(j))");
+                out.println("               If IsNull(cell_value) Then cell_value = \"\""); // Handle null values
+                out.println("               row_data = row_data & cell_value & vbTab");
+                out.println("            Next");
+                out.println("            WScript.StdOut.WriteLine \"DATA:\" & row_data");
+                out.println("         Next");
+                out.println("         WScript.StdOut.WriteLine \"PROGRESS:\" & (chunk_end + 1)");
+                out.println("      Next");
+                out.println("   End If");
+                out.println("End If");
+            }
+
+            System.out.println("Running SAP Script for Backend Capture...");
+            Process process = Runtime.getRuntime().exec("cscript.exe //NoLogo " + vbsFile.getAbsolutePath());
+            List<String[]> sapRecords = new ArrayList<>();
+            StringBuilder lastErrorMessage = new StringBuilder();
+
+            Thread dataCapture = new Thread(() -> {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.startsWith("DATA:")) {
+                            sapRecords.add(line.substring(5).split("\t", -1));
+                        } else if (line.startsWith("PROGRESS:")) {
+                            System.out.println("SAP Fetch Progress: " + line.substring(9).trim());
+                        } else if (line.startsWith("ERROR:")) {
+                            lastErrorMessage.append(line);
+                        }
+                    }
+                } catch (IOException ignored) {}
+            });
+
+            dataCapture.start();
+            process.waitFor();
+            dataCapture.join();
+
+            if (lastErrorMessage.length() > 0) {
+                JOptionPane.showMessageDialog(null, "SAP Error: " + lastErrorMessage.toString());
+                return null;
+            }
+
+            if (sapRecords.isEmpty()) {
+                JOptionPane.showMessageDialog(null, "No data captured from SAP. Ensure results are displayed.");
+                return null;
+            }
+
+            System.out.println("Direct Capture Finished. Total records: " + sapRecords.size());
+            return sapRecords;
+
+        } catch (Exception e) {
+            System.err.println("SAP Script error: " + e.getMessage());
+            JOptionPane.showMessageDialog(null, "SAP Script execution failed: " + e.getMessage() + "\n" +
+                    "Please ensure SAP GUI is running and scripting is enabled.", "SAP Script Error", JOptionPane.ERROR_MESSAGE);
+            return null;
+        }
+    }
+
+    /**
+     * Reads the tab-separated text file generated from the SAP clipboard.
+     */
+    private static List<String[]> readTextExport(String filePath) throws IOException {
+        List<String[]> records = new ArrayList<>();
+        File file = new File(filePath);
+        if (!file.exists() || file.length() == 0) return records;
+
+        // SAP text exports are typically UTF-16 encoded
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(file), "UTF-16"))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                String trimmed = line.trim();
+                if (trimmed.isEmpty() || trimmed.startsWith("---") || trimmed.startsWith("|")) continue;
+                
+                String[] columns = line.split("\t");
+                // Ensure there's actual data, not just a single empty string from split
+                if (columns.length > 0 && !(columns.length == 1 && columns[0].isEmpty())) {
+                    records.add(columns);
+                }
+            }
+        }
+        return records;
+    }
+
     /**
      * Converts date from DD.MM.YYYY to YYYY-MM-DD for SQL queries.
      */
@@ -222,7 +449,7 @@ public class ServiceClaimReconciliation {
         return input;
     }
 
-    private static File selectFile(String title, boolean isSave) {
+    private static File selectFile(String title, boolean isSave) { // Moved from main to be accessible
         JFileChooser chooser = new JFileChooser();
         chooser.setDialogTitle(title);
         
@@ -242,7 +469,7 @@ public class ServiceClaimReconciliation {
         return null;
     }
     
-    public static void process(List<String[]> dmsData, String file2Path, String outputPath) {
+    public static void process(List<String[]> dmsData, List<String[]> sapData, String outputPath) { // Changed file2Path to sapData
         long startTime = System.currentTimeMillis();
         try {
             if (dmsData == null || dmsData.isEmpty()) throw new IOException("No DMS data loaded.");
@@ -285,9 +512,11 @@ public class ServiceClaimReconciliation {
             System.out.println((excludedDmsRows.size() > 0 ? excludedDmsRows.size() - 1 : 0) + " records from " + claimsToExclude.size() + " claims moved to Excluded DMS sheet.");
             System.out.println((filteredDmsData.size() > 0 ? filteredDmsData.size() - 1 : 0) + " records remaining for reconciliation.");
 
-            System.out.println("Reading SAP File: " + file2Path);
-            List<String[]> sapData = readExcel(file2Path);
-            System.out.println("Loaded " + (sapData.size() > 0 ? sapData.size() - 1 : 0) + " data records from SAP.");
+            // SAP data is already loaded and passed as List<String[]>
+            int sapCount = (sapData.size() > 0 ? sapData.size() - 1 : 0);
+            System.out.println("Loaded " + sapCount + " data records from SAP.");
+            JOptionPane.showMessageDialog(null, "Successfully loaded " + sapCount + " records from SAP.\n" +
+                    "Please verify this matches your expected count.", "SAP Data Verification", JOptionPane.INFORMATION_MESSAGE);
 
             System.out.println("Starting Reconciliation...");
             ReconResult result = reconcile(filteredDmsData, sapData);
@@ -1257,24 +1486,30 @@ public class ServiceClaimReconciliation {
      */
     private static String reformatDate(String val) {
         if (val == null || val.trim().isEmpty()) return val;
-        
-        // Fast check: Dates must have at least two '/' characters
-        int firstSlash = val.indexOf('/');
-        if (firstSlash == -1) return val;
-        int secondSlash = val.indexOf('/', firstSlash + 1);
-        if (secondSlash == -1) return val;
+
+        // Determine delimiter
+        String delimiter;
+        if (val.contains("/")) {
+            delimiter = "/";
+        } else if (val.contains(".")) {
+            delimiter = "\\."; // Use \\. for literal dot in regex split
+        } else {
+            return val; // No recognized delimiter
+        }
 
         try {
-            String[] parts = val.split("/");
+            String[] parts = val.split(delimiter);
             if (parts.length != 3) return val;
 
-            String mm = parts[0].trim();
-            String dd = parts[1].trim();
-            String yy = parts[2].trim();
+            // Detect if format is MM/dd/yy (Excel) or dd.MM.yyyy (SAP GUI)
+            boolean isDots = delimiter.equals("\\.");
+            String dd = isDots ? parts[0].trim() : parts[1].trim(); // dd is first part for dd.MM.yyyy, second for MM/dd/yy
+            String mm = isDots ? parts[1].trim() : parts[0].trim(); // mm is second part for dd.MM.yyyy, first for MM/dd/yy
+            String yy = parts[2].trim(); // Year is always the third part
 
-            if (mm.length() == 1) mm = "0" + mm;
-            if (dd.length() == 1) dd = "0" + dd;
-            if (yy.length() == 4) yy = yy.substring(2); // Convert 2024 to 24
+            if (mm.length() == 1) mm = "0" + mm; // Pad month
+            if (dd.length() == 1) dd = "0" + dd; // Pad day
+            if (yy.length() == 4) yy = yy.substring(2); // Convert 4-digit year to 2-digit
 
             return dd + "/" + mm + "/" + yy;
         } catch (Exception e) {

@@ -757,7 +757,6 @@ public class ServiceClaimReconciliation {
         outHeader.add("DMS Line Amount");
         outHeader.add("SAP Amount");
         outHeader.add("Amount Remark");
-        outHeader.add("ageing remark");
         outHeader.add("Final Remark");
         outHeader.add("Final Line Level Remark");
         outHeader.add("final remark for summary");
@@ -924,28 +923,6 @@ public class ServiceClaimReconciliation {
                 hsnSacRemark = "Not Present in SAP";
             }
 
-            // --- Ageing Remark Calculation ---
-            String ageingRemark = "Interfaced";
-            if (sapRow == null) {
-                try {
-                    SimpleDateFormat sdfBucket = new SimpleDateFormat("dd/MM/yy");
-                    java.util.Date subDate = sdfBucket.parse(dmsDate);
-                    if (subDate != null) {
-                        long diff = System.currentTimeMillis() - subDate.getTime();
-                        long days = diff / (1000L * 60 * 60 * 24);
-                        if (days <= 30) ageingRemark = "0-30";
-                        else if (days <= 60) ageingRemark = "31-60";
-                        else if (days <= 90) ageingRemark = "61-90";
-                        else if (days <= 120) ageingRemark = "91-120";
-                        else if (days <= 180) ageingRemark = "121-180";
-                        else if (days <= 365) ageingRemark = "181-365";
-                        else ageingRemark = ">365";
-                    }
-                } catch (Exception e) {
-                    ageingRemark = "Invalid Date";
-                }
-            }
-
             // --- Update claim-level status ---
             // Collect all mismatch reasons for the entire claim.
             Set<String> mismatchReasons = claimLevelMismatchReasons.computeIfAbsent(claimNo, k -> new HashSet<>());
@@ -1010,7 +987,6 @@ public class ServiceClaimReconciliation {
             outRow[idx++] = dmsLineAmt;
             outRow[idx++] = sapAmt;
             outRow[idx++] = amtRemark;
-            outRow[idx++] = ageingRemark;
             // Final Remark (last column) will be filled in second pass
             outRow[idx++] = ""; // Final Remark
             outRow[idx++] = lineLevelRemark; // Line Level
@@ -1224,9 +1200,6 @@ public class ServiceClaimReconciliation {
             
             // Create Ageing Sheet
             createAgeingSheet(workbook, rows);
-
-            // Create Ageing Data Sheet (Header Level)
-            createAgeingDataSheet(workbook, rows);
 
             // Create SAP Leftover Sheet
             Sheet leftoverSheet = workbook.createSheet("SAP Leftover");
@@ -1622,99 +1595,6 @@ public class ServiceClaimReconciliation {
         for (int i = 0; i < headers.length; i++) sheet.autoSizeColumn(i);
     }
 
-    private static void createAgeingDataSheet(Workbook workbook, List<String[]> rows) {
-        if (rows == null || rows.isEmpty()) return;
-
-        Sheet sheet = workbook.createSheet("Ageing Data");
-        if (sheet instanceof SXSSFSheet) {
-            ((SXSSFSheet) sheet).trackAllColumnsForAutoSizing();
-        }
-
-        String[] reconciliationHeader = rows.get(0);
-        int ageingRemarkIdx = -1;
-        int summaryRemarkIndex = -1; // "final remark for summary" column
-
-        // Find required column indices from the reconciliation header
-        for (int i = 0; i < reconciliationHeader.length; i++) {
-            if ("ageing remark".equalsIgnoreCase(reconciliationHeader[i])) {
-                ageingRemarkIdx = i;
-            } else if ("final remark for summary".equalsIgnoreCase(reconciliationHeader[i])) {
-                summaryRemarkIndex = i;
-            }
-        }
-
-        // If crucial columns are not found, we cannot create this sheet meaningfully
-        if (ageingRemarkIdx == -1 || summaryRemarkIndex == -1) {
-            System.err.println("Warning: Required columns for 'Ageing Data' sheet not found. Skipping sheet creation.");
-            return;
-        }
-
-        // Styles for the new sheet
-        CellStyle headerStyle = workbook.createCellStyle();
-        Font headerFont = workbook.createFont();
-        headerFont.setBold(true);
-        headerStyle.setFont(headerFont);
-        headerStyle.setBorderBottom(BorderStyle.THIN);
-        headerStyle.setBorderTop(BorderStyle.THIN);
-        headerStyle.setBorderLeft(BorderStyle.THIN);
-        headerStyle.setBorderRight(BorderStyle.THIN);
-
-        CellStyle dataStyle = workbook.createCellStyle();
-        dataStyle.setBorderBottom(BorderStyle.THIN);
-        dataStyle.setBorderTop(BorderStyle.THIN);
-        dataStyle.setBorderLeft(BorderStyle.THIN);
-        dataStyle.setBorderRight(BorderStyle.THIN);
-
-        // Create header row for the "Ageing Data" sheet
-        String[] newSheetHeaders = {"Claim Number", "Claim Date", "Service Type", "Submission Date", "Ageing Remark"};
-        Row excelHeader = sheet.createRow(0);
-        for (int i = 0; i < newSheetHeaders.length; i++) {
-            Cell cell = excelHeader.createCell(i);
-            cell.setCellValue(newSheetHeaders[i]);
-            cell.setCellStyle(headerStyle);
-        }
-
-        // Use a TreeMap to store unique claims and their ageing remarks, maintaining sorted order by claim number
-        Map<String, String[]> uniqueAgeingClaims = new TreeMap<>();
-
-        // Iterate through the reconciliation results (line-level) to extract header-level ageing data
-        // Start from 1 to skip the header row
-        for (int i = 1; i < rows.size(); i++) {
-            String[] rowData = rows.get(i);
-            
-            String claimNo = getVal(rowData, 2); // Column C
-            String summaryRemark = (summaryRemarkIndex < rowData.length) ? rowData[summaryRemarkIndex] : "";
-            String ageingRemark = (ageingRemarkIdx < rowData.length) ? rowData[ageingRemarkIdx] : "";
-
-            // We want header-level claims that are 'Not in SAP' AND have a valid ageing remark.
-            // The 'final remark for summary' column is only populated for the first line of a unique claim,
-            // which ensures we process claims at the header level.
-            if (!claimNo.isEmpty() && summaryRemark != null && summaryRemark.contains("Not in SAP") && 
-                !ageingRemark.isEmpty() && !"Interfaced".equalsIgnoreCase(ageingRemark) && 
-                !"Invalid Date".equalsIgnoreCase(ageingRemark) && !uniqueAgeingClaims.containsKey(claimNo)) {
-                
-                String claimDate = getVal(rowData, 1);   // Column B
-                String serviceType = getVal(rowData, 4); // Column E
-                String subDate = getVal(rowData, 9);     // Column J
-                uniqueAgeingClaims.put(claimNo, new String[]{claimNo, claimDate, serviceType, subDate, ageingRemark});
-            }
-        }
-
-        // Populate the new sheet with header-level unique claims
-        int rowNum = 1;
-        for (String[] data : uniqueAgeingClaims.values()) {
-            Row row = sheet.createRow(rowNum++);
-            for (int j = 0; j < data.length; j++) {
-                Cell cell = row.createCell(j);
-                cell.setCellValue(data[j]);
-                cell.setCellStyle(dataStyle);
-            }
-        }
-        
-        // Auto-size columns for readability
-        for (int i = 0; i < newSheetHeaders.length; i++) sheet.autoSizeColumn(i);
-    }
-
     private static int writeSummaryTable(Sheet sheet, Map<String, Map<String, Integer>> data, List<String> remarkList, CellStyle headerStyle, CellStyle dataStyle, int startRow) {
         int rowNum = startRow;
         Row headerRow = sheet.createRow(rowNum++);
@@ -1883,37 +1763,11 @@ public class ServiceClaimReconciliation {
         int totalCols = result.mainRows.get(0).length;
         int summaryColIdx = totalCols - 1; int lineLevelColIdx = totalCols - 2;
 
-        // --- Ageing Calculation for Dashboard Pie Chart ---
-        Map<String, Integer> ageingPieBreakdown = new LinkedHashMap<>();
-        String[] ageingLabels = {"0-30", "31-60", "61-90", "91-120", "121-180", "181-365", ">365"};
-        for(String label : ageingLabels) ageingPieBreakdown.put(label, 0);
-
         // Determine where DMS columns end and Reconciliation results start
         int originalCols = 0;
         String[] headerRow = result.mainRows.get(0);
-        int ageingRemarkIdx = -1;
         for (int i = 0; i < headerRow.length; i++) {
-            if (headerRow[i].contains("All Result will be on the right side")) { 
-                originalCols = i; 
-            }
-            if ("ageing remark".equalsIgnoreCase(headerRow[i])) {
-                ageingRemarkIdx = i;
-            }
-        }
-
-        // Calculate counts for Ageing Pie Chart (based on unique claims)
-        for (int i = 1; i < result.mainRows.size(); i++) {
-            String[] row = result.mainRows.get(i);
-            String summaryRemark = row[summaryColIdx];
-            // Use the summary indicator to count unique claims
-            if (summaryRemark != null && !summaryRemark.isEmpty()) {
-                if (ageingRemarkIdx != -1) {
-                    String ar = row[ageingRemarkIdx];
-                    if (ageingPieBreakdown.containsKey(ar)) {
-                        ageingPieBreakdown.put(ar, ageingPieBreakdown.get(ar) + 1);
-                    }
-                }
-            }
+            if (headerRow[i].contains("All Result will be on the right side")) { originalCols = i; break; }
         }
 
         // Pre-calculate claim-level statuses for Service Type drill down
@@ -1954,32 +1808,31 @@ public class ServiceClaimReconciliation {
             int rIdx = originalCols;
             String rawClaimNo = getVal(row, 2);
             String claimStatus = claimStatuses.getOrDefault(rawClaimNo, "");
-            
+
             dataJs.append("{")
                   .append("c:\"").append(esc(rawClaimNo)).append("\",")
-                  .append("cd:\"").append(esc(getVal(row, 1))).append("\",")
+                  .append("cd:\"").append(esc(getVal(row, 8))).append("\",")
                   .append("s:\"").append(esc(getVal(row, 4))).append("\",")
                   .append("csr:\"").append(esc(claimStatus)).append("\",")
                   .append("pn:\"").append(esc(getVal(row, 20))).append("\",")
                   .append("ds:\"").append(esc(row[rIdx + 10])).append("\",")
                   .append("da:\"").append(esc(row[rIdx + 29])).append("\",")
-                  .append("dc1:\"").append(row[rIdx + 12]).append("\",")
-                  .append("dc2:\"").append(row[rIdx + 19]).append("\",")
-                  .append("ds1:\"").append(row[rIdx + 13]).append("\",")
-                  .append("ds2:\"").append(row[rIdx + 20]).append("\",")
-                  .append("di1:\"").append(row[rIdx + 14]).append("\",")
-                  .append("di2:\"").append(row[rIdx + 21]).append("\",")
+                  .append("dc1:\"").append(esc(row[rIdx + 12])).append("\",")
+                  .append("dc2:\"").append(esc(row[rIdx + 19])).append("\",")
+                  .append("ds1:\"").append(esc(row[rIdx + 13])).append("\",")
+                  .append("ds2:\"").append(esc(row[rIdx + 20])).append("\",")
+                  .append("di1:\"").append(esc(row[rIdx + 14])).append("\",")
+                  .append("di2:\"").append(esc(row[rIdx + 21])).append("\",")
                   .append("sdd:\"").append(esc(row[rIdx + 9])).append("\",")
                   .append("spd:\"").append(esc(row[rIdx + 3])).append("\",")
-                  .append("sc1:\"").append(row[rIdx + 15]).append("\",")
-                  .append("sc2:\"").append(row[rIdx + 22]).append("\",")
-                  .append("ss1:\"").append(row[rIdx + 16]).append("\",")
-                  .append("ss2:\"").append(row[rIdx + 23]).append("\",")
-                  .append("si1:\"").append(row[rIdx + 17]).append("\",")
-                  .append("si2:\"").append(row[rIdx + 24]).append("\",")
+                  .append("sc1:\"").append(esc(row[rIdx + 15])).append("\",")
+                  .append("sc2:\"").append(esc(row[rIdx + 22])).append("\",")
+                  .append("ss1:\"").append(esc(row[rIdx + 16])).append("\",")
+                  .append("ss2:\"").append(esc(row[rIdx + 23])).append("\",")
+                  .append("si1:\"").append(esc(row[rIdx + 17])).append("\",")
+                  .append("si2:\"").append(esc(row[rIdx + 24])).append("\",")
                   .append("cr:\"").append(esc(row[totalCols-3])).append("\",")
                   .append("lr:\"").append(esc(row[lineLevelColIdx])).append("\",")
-                  .append("ar:\"").append(ageingRemarkIdx != -1 ? esc(row[ageingRemarkIdx]) : "").append("\",")
                   .append("pri:").append((row[summaryColIdx] != null && !row[summaryColIdx].isEmpty()) ? "true" : "false")
                   .append("},");
             
@@ -2001,7 +1854,7 @@ public class ServiceClaimReconciliation {
             excludedCsCount = excludedClaimNos.size();
         }
 
-        // Helper to format data for Chart.js
+        // Helper to format data for Chart.js - ensuring labels are sanitized for JS strings
         java.util.function.Function<Map<String, Integer>, String[]> formatChartData = map -> {
             StringBuilder lbls = new StringBuilder();
             StringBuilder cnts = new StringBuilder();
@@ -2017,18 +1870,6 @@ public class ServiceClaimReconciliation {
 
         String[] claimData = formatChartData.apply(fullBreakdown);
         String[] lineData = formatChartData.apply(lineLevelBreakdown);
-
-        // Ageing Chart Data
-        StringBuilder ageingLabelsSb = new StringBuilder();
-        StringBuilder ageingCountsSb = new StringBuilder();
-        for (Map.Entry<String, Integer> entry : ageingPieBreakdown.entrySet()) {
-            if (entry.getValue() > 0) {
-                ageingLabelsSb.append("'").append(entry.getKey()).append("',");
-                ageingCountsSb.append(entry.getValue()).append(",");
-            }
-        }
-        String ageingLabelsStr = ageingLabelsSb.length() > 0 ? ageingLabelsSb.substring(0, ageingLabelsSb.length()-1) : "";
-        String ageingCountsStr = ageingCountsSb.length() > 0 ? ageingCountsSb.substring(0, ageingCountsSb.length()-1) : "";
 
         // --- New logic for Service Type Breakdown charts ---
         Map<String, Map<String, Integer>> serviceTypeRemarkBreakdown = new TreeMap<>(); // TreeMap to keep order
@@ -2154,8 +1995,7 @@ public class ServiceClaimReconciliation {
                 "      <div class='legend-area' id='legend_linePie'></div></div>" +
                 "    </div>" +
                 "    <div class='card'><h3>Ageing Distribution (Not in SAP)</h3>" +
-                "      <div class='chart-wrapper' style='height:280px;'><div class='chart-area'><canvas id='ageingPie'></canvas></div>" +
-                "      <div class='legend-area' id='legend_ageingPie'></div></div>" +
+                "      <div style='height:280px;'><canvas id='ageingBar'></canvas></div>" +
                 "    </div>" +
                 "  </div>" +
                 "  <div class='card'><h3>Remark Frequency Analysis (Lines)</h3><canvas id='barChart' style='max-height:400px;'></canvas></div>" +
@@ -2187,8 +2027,9 @@ public class ServiceClaimReconciliation {
                 "</div>" +
                 "<script src='https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js'></script>" +
                 "<script>" +
+                "try {" +
                 dataJs.toString() +
-                "Chart.register(ChartDataLabels);" +
+                "if(typeof ChartDataLabels !== 'undefined') Chart.register(ChartDataLabels);" +
                 "let currentFiltered = []; let currentPage = 1; let currentLevel = ''; let currentRemark = '';" +
                 "const pageSize = 100;" +
                 "const getColor = (label) => {" +
@@ -2197,13 +2038,6 @@ public class ServiceClaimReconciliation {
                 "  if (l.includes('gst % & line amount mismatch')) return '#90ee90';" +
                 "  if (l.includes('gst % mismatch')) return '#0984e3';" +
                 "  if (l.includes('gst value < 0.5 mismatch')) return '#f1c40f';" +
-                "  if (l === '0-30') return '#00b894';" +
-                "  if (l === '31-60') return '#55efc4';" +
-                "  if (l === '61-90') return '#81ecec';" +
-                "  if (l === '91-120') return '#fdcb6e';" +
-                "  if (l === '121-180') return '#e17055';" +
-                "  if (l === '181-365') return '#d63031';" +
-                "  if (l === '>365') return '#2d3436';" +
                 "  if (l.includes('not') || l.includes('mismatch')) return '#d63031';" +
                 "  const others = ['#0984e3', '#fdcb6e', '#6c5ce7', '#e84393', '#00cec9', '#fab1a0', '#ffeaa7', '#b2bec3'];" +
                 "  let hash = 0; for (let i = 0; i < label.length; i++) hash = label.charCodeAt(i) + ((hash << 5) - hash);" +
@@ -2223,7 +2057,6 @@ public class ServiceClaimReconciliation {
                 "    if(level === 'Claim Level') return d.pri && d.cr === remark;" +
                 "    if(level === 'Line Level') return d.lr === remark;" +
                 "    if(level === 'Service Type') return d.pri && d.s === sType && d.csr === remark;" +
-                "    if(level === 'Ageing') return d.pri && d.ar === remark;" +
                 "    return false;" +
                 "  });" +
                 "  currentPage = 1;" +
@@ -2291,7 +2124,6 @@ public class ServiceClaimReconciliation {
                 "};" +
                 "createDoughnut('claimPie', 'legend_claimPie', [" + claimData[0] + "], [" + claimData[1] + "], 'Claim Level');" +
                 "createDoughnut('linePie', 'legend_linePie', [" + lineData[0] + "], [" + lineData[1] + "], 'Line Level');" +
-                "createDoughnut('ageingPie', 'legend_ageingPie', [" + ageingLabelsStr + "], [" + ageingCountsStr + "], 'Ageing');" +
                 "const barChart = new Chart(document.getElementById('barChart'), {type:'bar', data:{ " +
                 "  labels:[" + lineData[0] + "], " +
                 "  datasets:[{label:'Line Count', data:[" + lineData[1] + "], backgroundColor: [" + lineData[0] + "].map(l => getColor(l)), borderRadius:5}]" +
@@ -2306,6 +2138,7 @@ public class ServiceClaimReconciliation {
                 "    } " +
                 "  }}, scales:{x:{beginAtZero:true}}}});" +
                 serviceTypeChartsJs.toString() + // Inject dynamically generated service type charts
+                "} catch (e) { console.error('Dashboard Error:', e); alert('Dashboard Initialization Error: ' + e.message); }" +
                 "</script></body></html>";
 
         try (PrintWriter out = new PrintWriter(new FileWriter(filePath))) {

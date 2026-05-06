@@ -2,6 +2,7 @@ import java.io.*;
 import java.util.*;
 import java.math.BigDecimal;
 import java.text.SimpleDateFormat;
+import java.sql.*;
 import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import org.apache.poi.ss.usermodel.*;
@@ -15,8 +16,11 @@ import org.apache.poi.xssf.streaming.SXSSFSheet;
 import org.apache.poi.xssf.eventusermodel.XSSFReader;
 import org.apache.poi.xssf.eventusermodel.XSSFSheetXMLHandler;
 import org.apache.poi.xssf.model.StylesTable;
+import java.awt.Desktop;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.InputSource;
+import java.awt.Toolkit;
+import java.awt.datatransfer.DataFlavor;
 import org.xml.sax.SAXException;
 import org.xml.sax.XMLReader;
 import org.xml.sax.helpers.XMLReaderFactory;
@@ -44,21 +48,54 @@ public class ServiceClaimReconciliation {
             // Set system look and feel for better UI
             UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
             
-            System.out.println("Please select the DMS Data file...");
-            File dmsFile = selectFile("Select DMS Data File", false);
-            if (dmsFile == null) return;
-            System.out.println("Selected: " + dmsFile.getAbsolutePath());
+            String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new java.util.Date());
+
+            // --- Step 1: Choose Data Source ---
+            String[] options = {"Extract from Raw Data (Excel)", "Extract from Synapse (Backend)"};
+            int choice = JOptionPane.showOptionDialog(null, "How would you like to load DMS data?", 
+                    "Select Data Source", JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, options, options[0]);
+
+            List<String[]> dmsData = null;
+            if (choice == 0) {
+                System.out.println("Please select the DMS Data file...");
+                File dmsFile = selectFile("Select DMS Data File", false);
+                if (dmsFile == null) return;
+                System.out.println("Reading DMS File: " + dmsFile.getAbsolutePath());
+                dmsData = readExcel(dmsFile.getAbsolutePath());
+            } else if (choice == 1) {
+                dmsData = fetchDmsDataFromSynapse();
+                if (dmsData != null && !dmsData.isEmpty()) {
+                    String synapseVerifyFile = "synapse_data_verify_" + timeStamp + ".xlsx";
+                    writeSimpleExcel(synapseVerifyFile, "Synapse Data", dmsData);
+                    System.out.println("Synapse raw data saved for verification: " + synapseVerifyFile);
+                }
+            } else {
+                return;
+            }
+
+            // --- Step 2: Choose SAP Data Source ---
+            String[] sapOptions = {"Extract from Raw Data (Excel)", "Extract from SAP Backend (Script)"};
+            int sapChoice = JOptionPane.showOptionDialog(null, "How would you like to load SAP data?", 
+                    "Select SAP Data Source", JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, sapOptions, sapOptions[0]);
+
+            List<String[]> sapData = null;
+            if (sapChoice == 0) {
+                System.out.println("Please select the SAP Data file...");
+                File sapFile = selectFile("Select SAP Data File", false);
+                if (sapFile == null) return;
+                System.out.println("Reading SAP File: " + sapFile.getAbsolutePath());
+                sapData = readExcel(sapFile.getAbsolutePath());
+            } else if (sapChoice == 1) {
+                sapData = downloadSapDataViaScript(timeStamp);
+            }
+
+            if (sapData == null || sapData.isEmpty()) return;
             
-            System.out.println("Please select the SAP Data file...");
-            File sapFile = selectFile("Select SAP Data File", false);
-            if (sapFile == null) return;
-            System.out.println("Selected: " + sapFile.getAbsolutePath());
-            
-            String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
             String outputFilePath = "reconciliation_output_" + timeStamp + ".xlsx";
-            System.out.println("Output will be saved to: " + outputFilePath);
+            String dashboardPath = "dashboard_" + timeStamp + ".html";
             
-            process(dmsFile.getAbsolutePath(), sapFile.getAbsolutePath(), outputFilePath);
+            System.out.println("Output will be saved to: " + outputFilePath);
+            process(dmsData, sapData, outputFilePath, dashboardPath);
             
         } catch (Exception e) {
             System.err.println("✗ Error: " + e.getMessage());
@@ -67,7 +104,342 @@ public class ServiceClaimReconciliation {
         }
     }
 
-    private static File selectFile(String title, boolean isSave) {
+    private static List<String[]> fetchDmsDataFromSynapse() {
+        String startInput = JOptionPane.showInputDialog("Enter Start Date (DD.MM.YYYY):");
+        String endInput = JOptionPane.showInputDialog("Enter End Date (DD.MM.YYYY):");
+        
+        if (startInput == null || endInput == null) return null;
+
+        List<String[]> records = new ArrayList<>();
+        // Note: These should ideally come from a config file
+        String url = "jdbc:sqlserver://re-platform-azure-synapse-analytics-prod.sql.azuresynapse.net:1433;database=RE_PLATFORM_SYNAPSE_SQL_ODS_PROD;encrypt=true;trustServerCertificate=false;hostNameInCertificate=*.sql.azuresynapse.net;loginTimeout=30;";
+        String user = "sqlreaduser_dmsqateam";
+        String password = "$o!4m014k@12";
+
+        // Convert DD.MM.YYYY to YYYY-MM-DD for Synapse SQL
+        String startDate = convertToSqlDate(startInput);
+        String endDate = convertToSqlDate(endInput);
+
+        System.out.println("Connecting to Synapse and fetching data for " + startDate + " to " + endDate + "...");
+
+        String query = "Select Distinct " +
+                "    DCT.CITY, " +
+                "    DA.name DEALER_NAME, " +
+                "    DCT.REGIONID as Region, " +
+                "    DCT.STATE as [STATE], " +
+                "    CASE " +
+                "        WHEN DCT.PwcClaimtype = 1 THEN 'Good Will' " +
+                "        WHEN DCT.PwcClaimtype = 2 THEN 'Technical Campaign' " +
+                "        WHEN DCT.PwcClaimtype = 3 THEN 'Extended warranty' " +
+                "        WHEN DCT.PwcClaimtype = 4 THEN 'In Transit' " +
+                "        WHEN DCT.PwcClaimtype = 6 THEN 'Spare part warranty' " +
+                "        WHEN DCT.PwcClaimtype = 7 THEN 'In-Warranty' " +
+                "        WHEN DCT.PwcClaimtype = 8 THEN 'Free service' " +
+                "        WHEN DCT.PwcClaimtype = 10 THEN 'AMC-EW' " +
+                "        WHEN DCT.PwcClaimtype = 11 THEN 'Paid service' " +
+                "        WHEN DCT.PwcClaimtype = 21 THEN 'REOWN In-Warranty' " +
+                "        WHEN DCT.PwcClaimtype = 20 THEN 'REOWN Free Service' " +
+                "        WHEN DCT.PwcClaimtype = 15 THEN 'EW-WT' " +
+                "        WHEN DCT.PwcClaimtype = 19  THEN 'RE Maestro' " +
+                "    END as [Claim_service_type], " +
+                "    DCT.PROVISIONALCLAIMNO, " +
+                "    DCT.DEALER DEALER_CODE, " +
+                "    DCT.CLAIMNO, " +
+                "    DCT.CLAIMDATE, " +
+                "    DCT.SUBMISIONDATE, " +
+                "    CAST(CASE " +
+                "        WHEN DCT.workflowstatus = 2 THEN 'Approved' " +
+                "        WHEN DCT.Workflowstatus = 3 THEN 'Rejected' " +
+                "        WHEN DCT.workflowstatus = 1 THEN 'Submitted' " +
+                "        WHEN DCT.workflowstatus = 4 THEN 'Returned' " +
+                "        ELSE 'Draft/Other' " +
+                "    END as varchar(15)) as workflowstatus, " +
+                "    DCT.MODELCODE as [Material_Code], " +
+                "    DCT.ITEMNAME [Model_Name], " +
+                "    DCT.CHASISNO, " +
+                "    DCT.ENGINENO, " +
+                "    DCT.DATEOFSALE, " +
+                "    DCT.ODOMETERKM, " +
+                "    DCT.DEFECTCODE, " +
+                "    DCL.PRIMARYPARTINDICATOR, " +
+                "    DCL.ITEMNAME as ItemDesc, " +
+                "    DCL.ITEMID partNumber, " +
+                "    DCL.PARTQTY [Claim_Quantity], " +
+                "    DCL.PARTPRICE AS [Unit_price], " +
+                "    DCT.CLAIMAMOUNT as [Line_amount], " +
+                "    DCL.CGST, " +
+                "    DCL.CGSTPERCENT, " +
+                "    DCL.SGST, " +
+                "    DCL.SGSTPERCENT, " +
+                "    DCL.IGST, " +
+                "    DCL.IGSTPERCENT, " +
+                "    DCL.SAPCRAMOUNT Amount, " +
+                "    DCT.DELIVERYCHALAN, " +
+                "    DCL.SAPDOCNO as [SAP_document_Number], " +
+                "    '' as [SAP_Accounting_Doc_No], " +
+                "    DCL.SAPCRDATE, " +
+                "    DCL.LABOURAMOUNT [SAP Part NDP/ Labor amount], " +
+                "    DCL.SAPCRAMOUNT, " +
+                "    DCL.INVOICENUMBER as [SAP Debit invoice number], " +
+                "    DCL.INVOICEDATE [SAP Debit invoice Date], " +
+                "    DCL.FFIRNO, " +
+                "    DCL.PWCFFIRSTATUS " +
+                "from PwCBYODClaimTblEntity DCT (nolock) " +
+                "Inner Join PwCBYODClaimLnEntity DCL (nolock) on DCL.claimno = DCT.claimno " +
+                "left join prod1_account DA on DA.xrm_sapdealercode = DCT.DEALER " +
+                "WHERE DCT.WorkflowStatus in (1,2,3,4) " +
+                "  AND cast(DCT.SUBMISIONDATE as date) between ? and ? " +
+                "  AND DCT.PwcClaimtype IN (1, 2, 3, 4, 6, 7, 8, 10, 11, 12, 15, 19, 20, 21) " +
+                "ORDER BY DCT.CLAIMNO ASC";
+
+        try (Connection conn = DriverManager.getConnection(url, user, password);
+             PreparedStatement pstmt = conn.prepareStatement(query)) {
+            
+            pstmt.setString(1, startDate);
+            pstmt.setString(2, endDate);
+            
+            try (ResultSet rs = pstmt.executeQuery()) {
+                ResultSetMetaData metaData = rs.getMetaData();
+                int columnCount = metaData.getColumnCount();
+
+                // Add Header Row
+                String[] headers = new String[columnCount];
+                for (int i = 1; i <= columnCount; i++) {
+                    headers[i - 1] = metaData.getColumnName(i);
+                }
+                records.add(headers);
+
+                // Add Data Rows
+                while (rs.next()) {
+                    String[] row = new String[columnCount];
+                    for (int i = 1; i <= columnCount; i++) {
+                        Object val = rs.getObject(i);
+                        row[i - 1] = (val == null) ? "" : val.toString();
+                    }
+                    records.add(row);
+                }
+            }
+            int rowCount = records.size() - 1; // Subtract 1 for the header row
+            System.out.println("Successfully fetched " + rowCount + " records from Synapse.");
+            
+            // Show count in UI for easy verification against Synapse
+            JOptionPane.showMessageDialog(null, "Successfully fetched " + rowCount + " records from Synapse.\n" +
+                    "Please verify this matches the result count in your Synapse workspace.", "Extraction Verification", JOptionPane.INFORMATION_MESSAGE);
+        } catch (SQLException e) {
+            System.err.println("Synapse Error: " + e.getMessage());
+            JOptionPane.showMessageDialog(null, "Error connecting to Synapse: " + e.getMessage());
+        }
+        return records;
+    }
+
+    /** 
+     * Automates SAP GUI to download data via SE16 based on provided VBScript logic.
+     */
+    private static List<String[]> downloadSapDataViaScript(String timeStamp) {
+        String startInput = JOptionPane.showInputDialog("Enter Start Date (DD.MM.YYYY):");
+        String endInput = JOptionPane.showInputDialog("Enter End Date (DD.MM.YYYY):");
+        
+        if (startInput == null || endInput == null) return null;
+
+        // Secure password prompt
+        JPanel panel = new JPanel();
+        JLabel label = new JLabel("Enter SAP Password:");
+        JPasswordField pass = new JPasswordField(10);
+        panel.add(label);
+        panel.add(pass);
+        String[] options = new String[]{"OK", "Cancel"};
+        int option = JOptionPane.showOptionDialog(null, panel, "SAP Authentication",
+                JOptionPane.NO_OPTION, JOptionPane.PLAIN_MESSAGE, null, options, options[1]);
+        
+        if (option != 0) return null;
+        String password = new String(pass.getPassword());
+
+        try {
+            File vbsFile = File.createTempFile("sap_extract", ".vbs");
+            vbsFile.deleteOnExit();
+            
+            try (PrintWriter out = new PrintWriter(new FileWriter(vbsFile))) {
+                out.println("On Error Resume Next"); // General error handling
+                out.println("Set SapGuiAuto = GetObject(\"SAPGUI\")");
+                out.println("Set application = SapGuiAuto.GetScriptingEngine");
+                // Select the specific connection
+                out.println("Set connection = application.OpenConnection(\"PRE Load Balance\", True)");
+                out.println("Set session = connection.Children(0)");
+                out.println("WScript.Sleep 2000"); // Wait for session to open
+
+                out.println("session.findById(\"wnd[0]\").maximize");
+                
+                // Perform Login
+                out.println("session.findById(\"wnd[0]/usr/txtRSYST-BNAME\").text = \"Bijus\"");
+                out.println("session.findById(\"wnd[0]/usr/pwdRSYST-BCODE\").text = \"" + password + "\"");
+                out.println("session.findById(\"wnd[0]\").sendVKey 0");
+                out.println("WScript.Sleep 2000"); // Wait for login to process
+                
+                // Handle Multi-Logon popup if it appears
+                out.println("If session.Children.Count > 1 Then");
+                out.println("   On Error Resume Next");
+                out.println("   session.findById(\"wnd[1]/usr/radMULTI_LOGON_OPT2\").select");
+                out.println("   session.findById(\"wnd[1]/tbar[0]/btn[0]\").press");
+                out.println("   WScript.Sleep 1000"); // Wait for popup to close
+                out.println("End If");
+                out.println("On Error GoTo 0"); // End specific error handling for popup
+                
+                // Navigate to SE16 and process the table
+                out.println("session.findById(\"wnd[0]/tbar[0]/okcd\").text = \"/nse16\"");
+                out.println("session.findById(\"wnd[0]\").sendVKey 0");
+                out.println("WScript.Sleep 1500"); // Wait for SE16 screen
+                out.println("session.findById(\"wnd[0]/usr/ctxtDATABROWSE-TABLENAME\").text = \"ZFI_SER_CLAIM\"");
+                out.println("session.findById(\"wnd[0]\").sendVKey 0");
+                out.println("WScript.Sleep 1500"); // Wait for selection screen to load
+
+                // Setting selection dates (DD.MM.YYYY)
+                out.println("session.findById(\"wnd[0]/usr/ctxtI5-LOW\").setFocus");
+                out.println("session.findById(\"wnd[0]/usr/ctxtI5-LOW\").text = \"" + startInput + "\"");
+                out.println("WScript.Sleep 200"); // Small pause after setting text
+                out.println("session.findById(\"wnd[0]/usr/ctxtI5-HIGH\").setFocus");
+                out.println("session.findById(\"wnd[0]/usr/ctxtI5-HIGH\").text = \"" + endInput + "\"");
+                // Clear "Maximum number of hits" limit to fetch all data
+                out.println("On Error Resume Next");
+                out.println("session.findById(\"wnd[0]/usr/txtMAX_SEL\").text = \"9999999\"");
+                out.println("session.findById(\"wnd[0]/usr/txtMAX_HITS\").text = \"9999999\"");
+                out.println("On Error GoTo 0");
+                out.println("session.findById(\"wnd[0]\").sendVKey 0"); // Ensure date input is registered
+                out.println("WScript.Sleep 500");
+                
+                // Execute (F8)
+                out.println("session.findById(\"wnd[0]/tbar[1]/btn[8]\").press");
+                out.println("WScript.Sleep 2000");
+                out.println("Do While session.Busy: WScript.Sleep 1000: Loop");
+                out.println("WScript.Sleep 2000"); 
+
+                // 1. POPUP HANDLER: Handle "Number of hits" or "Information" popups
+                out.println("While session.Children.Count > 1");
+                out.println("   On Error Resume Next");
+                out.println("   session.findById(\"wnd[1]/tbar[0]/btn[0]\").press");
+                out.println("   WScript.Sleep 1500");
+                out.println("   On Error GoTo 0");
+                out.println("Wend");
+                
+                // 2. VERIFICATION & SCROLLING: Ensure we are on a result screen with a Grid
+                out.println("On Error Resume Next");
+                out.println("Set grid = session.findById(\"wnd[0]/usr/cntlGRID1/shellcont/shell\", False)");
+                out.println("If Not grid Is Nothing Then");
+                out.println("   WScript.Sleep 1000");
+                out.println("   grid.setFocus");
+                // Force load all data into buffer by jumping to bottom and back
+                out.println("   grid.firstVisibleRow = grid.rowCount - 1");
+                out.println("   WScript.Sleep 3000");
+                out.println("   grid.firstVisibleRow = 0");
+                out.println("   WScript.Sleep 1500");
+
+                // 3. EXPORT TO CLIPBOARD: Using the button and sequence provided
+                out.println("   session.findById(\"wnd[0]/tbar[1]/btn[45]\").press");
+                out.println("   WScript.Sleep 3000"); 
+                out.println("   session.findById(\"wnd[1]/usr/subSUBSCREEN_STEPLOOP:SAPLSPO5:0150/sub:SAPLSPO5:0150/radSPOPLI-SELFLAG[4,0]\").select");
+                out.println("   session.findById(\"wnd[1]/usr/subSUBSCREEN_STEPLOOP:SAPLSPO5:0150/sub:SAPLSPO5:0150/radSPOPLI-SELFLAG[4,0]\").setFocus");
+                out.println("   session.findById(\"wnd[1]/tbar[0]/btn[0]\").press");
+                out.println("   WScript.Sleep 3000");
+                out.println("End If");
+                out.println("On Error GoTo 0");
+            }
+
+            System.out.println("Running SAP Script for Clipboard Capture...");
+            Process process = Runtime.getRuntime().exec("cscript.exe //NoLogo " + vbsFile.getAbsolutePath());
+            process.waitFor();
+
+            // Capture data from system clipboard
+            System.out.println("Processing clipboard data...");
+            String clipboardContent = "";
+            try {
+                // Small pause to allow OS to finish clipboard operation
+                Thread.sleep(1000);
+                clipboardContent = (String) Toolkit.getDefaultToolkit().getSystemClipboard().getData(DataFlavor.stringFlavor);
+            } catch (Exception ex) {
+                System.err.println("Clipboard Access Error: " + ex.getMessage());
+            }
+
+            if (clipboardContent == null || clipboardContent.trim().isEmpty()) {
+                JOptionPane.showMessageDialog(null, "No data captured from SAP Clipboard. Ensure SAP is open and reachable.");
+                return null;
+            }
+
+            List<String[]> sapRecords = new ArrayList<>();
+            String[] lines = clipboardContent.split("\\r?\\n");
+            for (String line : lines) {
+                String trimmed = line.trim();
+                if (trimmed.isEmpty() || trimmed.startsWith("---")) continue;
+                
+                String[] cols;
+                if (line.contains("\t")) {
+                    cols = line.split("\t", -1);
+                } else if (line.contains("|")) {
+                    String cleaned = trimmed;
+                    if (cleaned.startsWith("|")) cleaned = cleaned.substring(1);
+                    if (cleaned.endsWith("|")) cleaned = cleaned.substring(0, cleaned.length() - 1);
+                    cols = cleaned.split("\\|", -1);
+                } else {
+                    cols = new String[]{line};
+                }
+                for (int i = 0; i < cols.length; i++) cols[i] = cols[i].trim();
+                sapRecords.add(cols);
+            }
+
+            if (!sapRecords.isEmpty()) {
+                String sapVerifyFile = "sap_data_verify_" + timeStamp + ".xlsx";
+                // Skip the first row (header) for the SAP verification file as requested
+                List<String[]> sapRecordsToVerify = (sapRecords.size() > 1) ? sapRecords.subList(1, sapRecords.size()) : sapRecords;
+                writeSimpleExcel(sapVerifyFile, "SAP Raw Data", sapRecordsToVerify);
+                System.out.println("SAP raw data saved for verification: " + sapVerifyFile);
+            }
+
+            System.out.println("Capture Finished. Total records: " + sapRecords.size());
+            return sapRecords;
+        } catch (Exception e) {
+            System.err.println("SAP Script error: " + e.getMessage());
+            JOptionPane.showMessageDialog(null, "SAP Script execution failed: " + e.getMessage() + "\n" +
+                    "Please ensure SAP GUI is running and scripting is enabled.", "SAP Script Error", JOptionPane.ERROR_MESSAGE);
+            return null;
+        }
+    }
+
+    /**
+     * Reads the tab-separated text file generated from the SAP clipboard.
+     */
+    private static List<String[]> readTextExport(String filePath) throws IOException {
+        List<String[]> records = new ArrayList<>();
+        File file = new File(filePath);
+        if (!file.exists() || file.length() == 0) return records;
+
+        // SAP text exports are typically UTF-16 encoded
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(file), "UTF-16"))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                String trimmed = line.trim();
+                if (trimmed.isEmpty() || trimmed.startsWith("---") || trimmed.startsWith("|")) continue;
+                
+                String[] columns = line.split("\t");
+                // Ensure there's actual data, not just a single empty string from split
+                if (columns.length > 0 && !(columns.length == 1 && columns[0].isEmpty())) {
+                    records.add(columns);
+                }
+            }
+        }
+        return records;
+    }
+
+    /**
+     * Converts date from DD.MM.YYYY to YYYY-MM-DD for SQL queries.
+     */
+    private static String convertToSqlDate(String input) {
+        if (input == null || !input.contains(".")) return input;
+        String[] parts = input.split("\\.");
+        if (parts.length == 3) {
+            return parts[2].trim() + "-" + parts[1].trim() + "-" + parts[0].trim();
+        }
+        return input;
+    }
+
+    private static File selectFile(String title, boolean isSave) { // Moved from main to be accessible
         JFileChooser chooser = new JFileChooser();
         chooser.setDialogTitle(title);
         
@@ -87,12 +459,10 @@ public class ServiceClaimReconciliation {
         return null;
     }
     
-    public static void process(String file1Path, String file2Path, String outputPath) {
+    public static void process(List<String[]> dmsData, List<String[]> sapData, String outputPath, String dashboardPath) { 
         long startTime = System.currentTimeMillis();
         try {
-            System.out.println("Reading DMS File: " + file1Path);
-            List<String[]> dmsData = readExcel(file1Path);
-            System.out.println("Loaded " + (dmsData.size() > 0 ? dmsData.size() - 1 : 0) + " data records from DMS.");
+            if (dmsData == null || dmsData.isEmpty()) throw new IOException("No DMS data loaded.");
 
             // --- New Filtering Logic ---
             System.out.println("Filtering DMS data based on excluded dealer codes...");
@@ -132,9 +502,11 @@ public class ServiceClaimReconciliation {
             System.out.println((excludedDmsRows.size() > 0 ? excludedDmsRows.size() - 1 : 0) + " records from " + claimsToExclude.size() + " claims moved to Excluded DMS sheet.");
             System.out.println((filteredDmsData.size() > 0 ? filteredDmsData.size() - 1 : 0) + " records remaining for reconciliation.");
 
-            System.out.println("Reading SAP File: " + file2Path);
-            List<String[]> sapData = readExcel(file2Path);
-            System.out.println("Loaded " + (sapData.size() > 0 ? sapData.size() - 1 : 0) + " data records from SAP.");
+            // SAP data is already loaded and passed as List<String[]>
+            int sapCount = (sapData.size() > 0 ? sapData.size() - 1 : 0);
+            System.out.println("Loaded " + sapCount + " data records from SAP.");
+            JOptionPane.showMessageDialog(null, "Successfully loaded " + sapCount + " records from SAP.\n" +
+                    "Please verify this matches your expected count.", "SAP Data Verification", JOptionPane.INFORMATION_MESSAGE);
 
             System.out.println("Starting Reconciliation...");
             ReconResult result = reconcile(filteredDmsData, sapData);
@@ -142,6 +514,16 @@ public class ServiceClaimReconciliation {
             System.out.println("Writing Output: " + outputPath);
             writeExcel(outputPath, result, excludedDmsRows);
             
+            System.out.println("Generating Dashboard: " + dashboardPath);
+            createDashboard(result, excludedDmsRows, dashboardPath);
+            
+            try {
+                File htmlFile = new File(dashboardPath);
+                Desktop.getDesktop().browse(htmlFile.toURI());
+            } catch (Exception e) {
+                System.err.println("Could not open browser: " + e.getMessage());
+            }
+
             System.out.println("SUCCESS: File Reconciliation Completed");
             
             long endTime = System.currentTimeMillis();
@@ -1104,28 +1486,185 @@ public class ServiceClaimReconciliation {
      */
     private static String reformatDate(String val) {
         if (val == null || val.trim().isEmpty()) return val;
-        
-        // Fast check: Dates must have at least two '/' characters
-        int firstSlash = val.indexOf('/');
-        if (firstSlash == -1) return val;
-        int secondSlash = val.indexOf('/', firstSlash + 1);
-        if (secondSlash == -1) return val;
+
+        // Determine delimiter
+        String delimiter;
+        if (val.contains("/")) {
+            delimiter = "/";
+        } else if (val.contains(".")) {
+            delimiter = "\\."; // Use \\. for literal dot in regex split
+        } else {
+            return val; // No recognized delimiter
+        }
 
         try {
-            String[] parts = val.split("/");
+            String[] parts = val.split(delimiter);
             if (parts.length != 3) return val;
 
-            String mm = parts[0].trim();
-            String dd = parts[1].trim();
-            String yy = parts[2].trim();
+            // Detect if format is MM/dd/yy (Excel) or dd.MM.yyyy (SAP GUI)
+            boolean isDots = delimiter.equals("\\.");
+            String dd = isDots ? parts[0].trim() : parts[1].trim(); // dd is first part for dd.MM.yyyy, second for MM/dd/yy
+            String mm = isDots ? parts[1].trim() : parts[0].trim(); // mm is second part for dd.MM.yyyy, first for MM/dd/yy
+            String yy = parts[2].trim(); // Year is always the third part
 
-            if (mm.length() == 1) mm = "0" + mm;
-            if (dd.length() == 1) dd = "0" + dd;
-            if (yy.length() == 4) yy = yy.substring(2); // Convert 2024 to 24
+            if (mm.length() == 1) mm = "0" + mm; // Pad month
+            if (dd.length() == 1) dd = "0" + dd; // Pad day
+            if (yy.length() == 4) yy = yy.substring(2); // Convert 4-digit year to 2-digit
 
             return dd + "/" + mm + "/" + yy;
         } catch (Exception e) {
             return val;
+        }
+    }
+
+    /**
+     * Helper method to write a simple list of string arrays to an Excel file.
+     */
+    private static void writeSimpleExcel(String filePath, String sheetName, List<String[]> data) {
+        try (Workbook workbook = new SXSSFWorkbook(100)) {
+            Sheet sheet = workbook.createSheet(sheetName);
+            // Start from the first row (index 0) to include headers
+            for (int i = 0; i < data.size(); i++) {
+                Row row = sheet.createRow(i); 
+                String[] rowData = data.get(i); 
+                for (int j = 0; j < rowData.length; j++) {
+                    row.createCell(j).setCellValue(rowData[j]);
+                }
+            }
+            try (FileOutputStream fileOut = new FileOutputStream(filePath)) {
+                workbook.write(fileOut);
+            }
+        } catch (IOException e) {
+            System.err.println("Error saving verification file: " + e.getMessage());
+        }
+    }
+
+    private static void createDashboard(ReconResult result, List<String[]> excludedDmsRows, String filePath) {
+        int totalClaims = 0;
+        int matchedClaims = 0;
+        int totalLines = 0;
+        int matchedLines = 0;
+
+        Map<String, Integer> fullBreakdown = new LinkedHashMap<>();
+        Map<String, Integer> lineLevelBreakdown = new LinkedHashMap<>();
+
+        int totalCols = result.mainRows.get(0).length;
+        int summaryColIdx = totalCols - 1;
+        int lineLevelColIdx = totalCols - 2;
+
+        for (int i = 1; i < result.mainRows.size(); i++) {
+            String[] row = result.mainRows.get(i);
+
+            // Line Level Counting
+            String lineRemark = row[lineLevelColIdx];
+            if (lineRemark != null && !lineRemark.isEmpty()) {
+                totalLines++;
+                if ("Interfaced".equalsIgnoreCase(lineRemark)) matchedLines++;
+                lineLevelBreakdown.put(lineRemark, lineLevelBreakdown.getOrDefault(lineRemark, 0) + 1);
+            }
+
+            // Claim Level Summary Counting (merged rows logic)
+            String summaryRemark = row[summaryColIdx];
+            if (summaryRemark == null || summaryRemark.isEmpty()) continue; 
+
+            totalClaims++;
+            if ("Interfaced".equalsIgnoreCase(summaryRemark)) {
+                matchedClaims++;
+            }
+            fullBreakdown.put(summaryRemark, fullBreakdown.getOrDefault(summaryRemark, 0) + 1);
+        }
+
+        // CS Excluded Calculation
+        int excludedCsCount = 0;
+        if (excludedDmsRows != null && excludedDmsRows.size() > 1) {
+            Set<String> excludedClaimNos = new HashSet<>();
+            for (int i = 1; i < excludedDmsRows.size(); i++) {
+                excludedClaimNos.add(getVal(excludedDmsRows.get(i), 2)); // Column C is Claim No
+            }
+            excludedCsCount = excludedClaimNos.size();
+        }
+
+        // Helper to format data for Chart.js
+        java.util.function.Function<Map<String, Integer>, String[]> formatChartData = new java.util.function.Function<Map<String, Integer>, String[]>() {
+            public String[] apply(Map<String, Integer> map) {
+                StringBuilder lbls = new StringBuilder();
+                StringBuilder cnts = new StringBuilder();
+                for (Map.Entry<String, Integer> entry : map.entrySet()) {
+                    lbls.append("'").append(entry.getKey().replace("'", "")).append("',");
+                    cnts.append(entry.getValue()).append(",");
+                }
+                return new String[]{
+                    lbls.length() > 0 ? lbls.substring(0, lbls.length() - 1) : "",
+                    cnts.length() > 0 ? cnts.substring(0, cnts.length() - 1) : ""
+                };
+            }
+        };
+
+        String[] claimData = formatChartData.apply(fullBreakdown);
+        String[] lineData = formatChartData.apply(lineLevelBreakdown);
+
+        String html = "<!DOCTYPE html><html><head><title>Recon Dashboard</title>" +
+                "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>" +
+                "<style>" +
+                "body{font-family:'Segoe UI', sans-serif; background:#f8f9fa; padding:40px; color:#2d3436;}" +
+                ".container{max-width:1400px; margin:0 auto;}" +
+                "h1{text-align:center; color:#0984e3; margin-bottom:40px; font-weight:600;}" +
+                ".card{background:white; padding:25px; border-radius:15px; box-shadow:0 10px 30px rgba(0,0,0,0.05); margin-bottom:30px;}" +
+                ".stats-grid{display:grid; grid-template-columns: repeat(4, 1fr); gap:20px; margin-bottom:30px;}" +
+                ".charts-grid{display:grid; grid-template-columns: 1fr 1fr; gap:30px;}" +
+                ".stat-box{margin-bottom:25px;}" +
+                ".stat-label{font-size:12px; color:#636e72; text-transform:uppercase; font-weight:bold; letter-spacing:1px;}" +
+                ".stat-value{font-size:28px; font-weight:700; display:block; margin-top:5px;}" +
+                "h3{margin-top:0; border-bottom:2px solid #f1f2f6; padding-bottom:10px; color:#2d3436; font-size:16px;}" +
+                ".excluded-card{background:#dfe6e9; border-left:5px solid #636e72;}" +
+                "</style></head><body>" +
+                "<div class='container'>" +
+                "<h1>Reconciliation Insight Dashboard</h1>" +
+                "  <div class='stats-grid'>" +
+                "    <div class='card'><h3>Processed Claims</h3>" +
+                "      <span class='stat-label'>Total</span><span class='stat-value'>" + totalClaims + "</span>" +
+                "      <span class='stat-label' style='margin-top:10px; display:block;'>Matched</span><span class='stat-value' style='color:#00b894;'>" + matchedClaims + "</span>" +
+                "    </div>" +
+                "    <div class='card'><h3>Processed Lines</h3>" +
+                "      <span class='stat-label'>Total</span><span class='stat-value'>" + totalLines + "</span>" +
+                "      <span class='stat-label' style='margin-top:10px; display:block;'>Matched</span><span class='stat-value' style='color:#00b894;'>" + matchedLines + "</span>" +
+                "    </div>" +
+                "    <div class='card'><h3>Exceptions</h3>" +
+                "      <span class='stat-label'>Mismatched Claims</span><span class='stat-value' style='color:#d63031;'>" + (totalClaims - matchedClaims) + "</span>" +
+                "      <span class='stat-label' style='margin-top:10px; display:block;'>Leftover SAP Rows</span><span class='stat-value'>" + (result.leftoverRows.size() - 1) + "</span>" +
+                "    </div>" +
+                "    <div class='card excluded-card'><h3>Data Filtering</h3>" +
+                "      <span class='stat-label'>CS Claims Excluded</span><span class='stat-value' style='color:#636e72;'>" + excludedCsCount + "</span>" +
+                "      <p style='font-size:11px; color:#636e72;'>These claims were identified as CS based on dealer codes and moved to the 'Excluded' sheet.</p>" +
+                "    </div>" +
+                "</div>" +
+                "<div class='charts-grid'>" +
+                "  <div class='card'><h3>Claim Level Distribution</h3><div style='height:300px;'><canvas id='claimPie'></canvas></div></div>" +
+                "  <div class='card'><h3>Line Level Distribution</h3><div style='height:300px;'><canvas id='linePie'></canvas></div></div>" +
+                "</div>" +
+                "<div class='card'><h3>Remark Frequency Analysis (Lines)</h3><canvas id='barChart' style='max-height:400px;'></canvas></div>" +
+                "</div>" +
+                "<script>" +
+                "const palette = ['#00b894', '#d63031', '#0984e3', '#fdcb6e', '#6c5ce7', '#e84393', '#00cec9', '#fab1a0', '#ffeaa7', '#b2bec3'];" +
+                "const options = { maintainAspectRatio:false, plugins:{ legend:{ position:'bottom', labels:{boxWidth:12, font:{size:11}}}} };" +
+                "new Chart(document.getElementById('claimPie'), {type:'doughnut', data:{ " +
+                "  labels:[" + claimData[0] + "], " +
+                "  datasets:[{data:[" + claimData[1] + "], backgroundColor:palette, borderWeight:0}]" +
+                "}, options: options});" +
+                "new Chart(document.getElementById('linePie'), {type:'doughnut', data:{ " +
+                "  labels:[" + lineData[0] + "], " +
+                "  datasets:[{data:[" + lineData[1] + "], backgroundColor:palette, borderWeight:0}]" +
+                "}, options: options});" +
+                "new Chart(document.getElementById('barChart'), {type:'bar', data:{ " +
+                "  labels:[" + lineData[0] + "], " +
+                "  datasets:[{label:'Line Count', data:[" + lineData[1] + "], backgroundColor:'#0984e3', borderRadius:5}]" +
+                "}, options:{indexAxis:'y', plugins:{legend:{display:false}}, scales:{x:{beginAtZero:true}}}});" +
+                "</script></body></html>";
+
+        try (PrintWriter out = new PrintWriter(new FileWriter(filePath))) {
+            out.println(html);
+        } catch (IOException e) {
+            System.err.println("Dashboard Error: " + e.getMessage());
         }
     }
 }
